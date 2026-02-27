@@ -1,0 +1,4 @@
+/target
+**/*.efi
+**/*.bin
+.DS_Store

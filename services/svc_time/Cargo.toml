@@ -1,0 +1,10 @@
+[package]
+name = "svc_time"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+kernel-builtin = []
+
+[dependencies]
+oneos-service = { path = "../sdk/oneos-service" }

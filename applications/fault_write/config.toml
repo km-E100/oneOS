@@ -1,0 +1,2 @@
+# fault_write: intentionally triggers InvalidMemoryAccess to validate Domain fault isolation.
+

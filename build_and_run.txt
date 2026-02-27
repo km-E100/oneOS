@@ -1,0 +1,100 @@
+oneOS 构建与 QEMU 运行指令（双架构，沿用 Zero OS 环境配置）
+===========================================================
+
+快速准备命令（Zero OS 同款）
+- rustup toolchain install nightly
+- rustup target add aarch64-unknown-none --toolchain nightly
+
+前置准备
+- 安装目标：rustup target add x86_64-unknown-uefi aarch64-unknown-uefi
+- 建议 nightly（.cargo/config.toml 已启用 build-std）
+- 安装 QEMU + OVMF/EDK2 固件（示例路径按 Homebrew 默认）
+
+使用 xtask（推荐）
+- 构建双架构：cargo run -p xtask -- build
+- 只构建 x86_64：cargo run -p xtask -- build --arch x86_64
+- 只构建 aarch64：cargo run -p xtask -- build --arch aarch64
+- 生成的 ESP 目录：
+  - dist/esp-x86_64/EFI/Boot/BOOTX64.EFI（bootloader）
+  - dist/esp-aarch64/EFI/Boot/BOOTAA64.EFI（bootloader）
+  - dist/esp-*/EFI/oneOS/KERNELX64.EFI / KERNELAA64.EFI（内核镜像）
+  - dist/esp-*/EFI/oneOS/KERNELX64.BIN / KERNELAA64.BIN（raw kernel，bootloader 优先加载）
+  - dist/universal/EFI/Boot/（同时含两架构 bootloader，与对应 KERNEL*）
+
+生成 GOES 系统镜像（主分区）
+- 生成 `dist/oneos-esp.img` + `dist/oneos-goes.img`：
+  - 无 admin：cargo run -p xtask -- install
+  - 含 admin（无密码，仅测试）：cargo run -p xtask -- install --admin
+  - 若镜像已存在且需要重写 System（例如切换默认用户为 admin）：cargo run -p xtask -- install --admin --recovery --sip-off
+  - 安全更新（不重写 System，仅追加记录占位）：cargo run -p xtask -- install --update
+- `xtask run` 若检测到 `dist/oneos-esp.img`/`dist/oneos-goes.img` 存在，会优先使用镜像启动（无需手动加 `-drive`）。
+
+Recovery / ESP 调试命令（用于验收第 6 阶段）
+--------------------------------------------
+说明：
+- 这些命令直接修改 `dist/oneos-esp.img` 中的：
+  - `\\EFI\\ONEOS\\BOOTFLAG.BIN`（ForceRecovery/MarkSuccess，一次性）
+  - `\\EFI\\ONEOS\\BOOTSTAT.BIN`（consecutive_failures + panic ring[8]）
+  - `\\EFI\\ONEOS\\SIP.BIN`（SIP 镜像值，仅用于 bootloader 透传/显示）
+- 常用流程：先 `xtask install` 生成镜像 → 写入 BootFlag/BootState → `xtask run` 启动观察 `oneOS[...|recovery]>`。
+
+查看当前状态：
+- cargo run -p xtask -- esp show
+
+强制下次进入 recovery（oneboot 读到后会自动清除）：
+- cargo run -p xtask -- esp force-recovery --state on
+
+模拟“连续失败 >= 3”（触发 recovery）：
+- cargo run -p xtask -- esp set-failures --count 3
+
+写入一条 panic 记录（并 failures += 1，写入 ring buffer）：
+- cargo run -p xtask -- esp record-panic --code 0xdeadbeef
+
+标记“下次启动成功后清零 failures”（oneboot 处理后会清除该标志）：
+- cargo run -p xtask -- esp mark-success
+
+设置 ESP SIP 镜像值（用于显示/覆盖，不等同于 GOES flags）：
+- cargo run -p xtask -- esp set-sip --sip on
+- cargo run -p xtask -- esp set-sip --sip off
+
+QEMU 运行示例
+- x86_64：
+  若有 VARS 文件（如 `/opt/homebrew/share/qemu/edk2-x86_64-vars.fd` 或 `edk2-i386-vars.fd`），可带上 `--vars`，否则可省略：
+  cargo run -p xtask -- run --arch x86_64 \
+    --firmware /opt/homebrew/share/qemu/edk2-x86_64-code.fd \
+    --display cocoa \
+    --mem 1024
+
+- aarch64：
+  cargo run -p xtask -- run --arch aarch64 \
+    --firmware /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+    --display cocoa \
+    --mem 1024
+
+Windows 主机支持（xtask + QEMU）
+--------------------------------
+说明：
+- `xtask install` 现在会用纯 Rust 生成 `dist/oneos-esp.img`（FAT32），不再依赖 `qemu-img/mtools`，因此可在 Windows 直接运行。
+- Windows 下 `--display cocoa` 不可用，推荐 `--display sdl`（默认 `--display auto` 会自动选 sdl）。
+
+准备：
+- 安装 nightly：`rustup toolchain install nightly`
+- 安装目标：`rustup target add x86_64-unknown-uefi aarch64-unknown-uefi x86_64-unknown-none aarch64-unknown-none-softfloat`
+- 安装 QEMU（确保 `qemu-system-x86_64`/`qemu-system-aarch64` 在 PATH）
+- 设置固件路径（必须）：用环境变量或 `--firmware` 指定
+  - x86_64 CODE：`ONEOS_EDK2_X86_64_CODE`
+  - aarch64 CODE：`ONEOS_EDK2_AARCH64_CODE`
+  - x86_64 VARS（可选）：`ONEOS_EDK2_X86_64_VARS`
+
+示例（PowerShell）：
+- `cargo run -p xtask -- install --admin`
+- `cargo run -p xtask -- run --arch aarch64 --display sdl --mem 1024`
+- `cargo run -p xtask -- run --arch x86_64  --display sdl --mem 1024`
+
+手动构建（若不使用 xtask）
+- x86_64：cargo build -p oneos-kernel --bin oneos-x86_64 --target x86_64-unknown-uefi
+- aarch64：cargo build -p oneos-kernel --bin oneos-aarch64 --target aarch64-unknown-uefi
+- 将生成的可执行复制到 FAT 目录：
+  - x86_64：<esp>/EFI/Boot/BOOTX64.EFI
+  - aarch64：<esp>/EFI/Boot/BOOTAA64.EFI
+- 使用上面的 QEMU 命令，将 <esp> 目录作为 fat:rw:<esp> 传给 -drive 即可。

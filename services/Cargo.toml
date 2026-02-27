@@ -1,0 +1,14 @@
+[workspace]
+members = [
+  "sdk/oneos-service",
+  "oneconsole",
+  "goesd",
+  "svc_logger",
+  "svc_time",
+  "svc_notify"
+]
+resolver = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

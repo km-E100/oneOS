@@ -1,0 +1,4 @@
+name = "hello"
+version = "0.1"
+entry = "elf:v1"
+caps_mask = "0x11" # CONSOLE + IPC

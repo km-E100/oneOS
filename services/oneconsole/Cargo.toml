@@ -1,0 +1,12 @@
+[package]
+name = "oneconsole"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# Enabled when this crate is linked into the kernel as a Rust dependency.
+# Avoid exporting an unmangled global `oneos_service_main` symbol (would collide with other services).
+kernel-builtin = []
+
+[dependencies]
+oneos-service = { path = "../sdk/oneos-service" }

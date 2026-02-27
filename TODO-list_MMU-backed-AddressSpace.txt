@@ -1,0 +1,338 @@
+oneOS v2+（AArch64）MMU-backed AddressSpace / Page-Table Isolation TODO
+================================================================================
+
+目标（Goal）
+------------------------------------------------------------------------------
+在不引入传统 user/kernel 特权级切换（不做 EL0 用户态）的前提下，
+为 oneOS 的 Sandbox Domain（尤其 AppDomain）提供“硬件级地址空间隔离”：
+- 每个 AppDomain 拥有独立页表（MMU-backed AddressSpace）
+- App 只能访问：AppBinary(RX)、App stack(RW)、App heap(RW 可选)、LAD:<app>(RW)、只读 AppApi 区
+- 任何越界/未映射/权限违规访问 -> Data Abort -> Domain fault -> kill/restart（不 panic，不影响 Shell）
+- KernelDomain / ShellServiceDomain 继续使用内核主 AddressSpace（共享页表）
+- 只在 app run / exit 进行 AddressSpace 切换；不做抢占调度、不做多线程、不做 COW/VMA/mmap
+
+硬约束（Must）
+------------------------------------------------------------------------------
+- AArch64 优先，但必须规划 x86_64 对等能力（同一语义，不同实现）。
+- 不引入 EL0 用户态；全部仍在 EL1 运行。
+- 不改动“四大系统级 Workspace 冻结语义”（System/Users/Applications/Library）。
+- 能跑：必须保持可编译可启动可进 shell；每阶段都有验收命令与 serial log。
+- 故障处理：App fault 只能杀 AppDomain；Kernel panic 只用于不可恢复内核错误。
+
+里程碑（Milestones）
+------------------------------------------------------------------------------
+M0. 规范与抽象：AddressSpace/MemoryView 接口固化（仍用 region set 做软件检查）
+M1. 页表构建：能为 AppDomain 构建独立页表，并在不切换的情况下自检映射正确
+M2. 切换与异常：进入 AppDomain 时切换页表；Data Abort 捕获并转 Domain fault kill
+M3. 权限强化：WX 规则、只读映射、LAD RW、AppWS RO，严格执行
+M4. 稳定性与审计：TLB/ASID、fault 记录、recovery 兼容、回归测试
+M5. 性能与扩展：最小 heap、共享页、未来多 Domain/服务预留（不在本 TODO 实现）
+X1. x86_64 对等实现：CR3 切换 + #PF 归因（不引入 ring3）
+X2. x86_64 权限强化：NX/WP/SMEP/SMAP（按可用性分阶段启用）
+
+实现备注（已遇到并修复）
+------------------------------------------------------------------------------
+- [x] 修复 heap free-list allocator 对齐/切分 bug：避免 GOES replay/index rebuild 时出现“明明有大块空闲却 OOM 64KiB”的假 OOM（会阻塞进入 shell 与后续 MMU 阶段验证）。
+
+================================================================================
+阶段 1：抽象层与地址空间语义冻结（M0）
+--------------------------------------------------------------------------------
+1.1 AddressSpace 抽象
+- [x] 新建模块：kernel/src/mmu 或 kernel/src/memory
+- [x] 定义 AddressSpaceId、AddressSpaceKind（Kernel / App）
+- [x] 定义 AddressSpace 结构（当前仅保存 regions + future pt_root）
+- [x] 将 “region set” 从 AppDomain 结构中抽到 AddressSpace（一个域绑定一个 AddressSpace）
+
+1.2 统一内存访问校验入口（为后续页表异常统一语义）
+- [x] 规范：所有 AppApi 对指针/长度的校验必须调用 `addrspace::check_user_ptr(domain, ptr, len, Access)`（RW/RO/EXEC）
+- [x] 违规 -> FaultKind::InvalidMemoryAccess（统一语义：越界/非法访问都按域内存违规处理）
+- [x] 在日志中打印 domain id + addr + len + access + region 命中情况（失败时打印，避免 log spam）
+  - [x] 失败日志必须零分配（避免失败路径叠加 heap 压力导致 OOM）
+
+1.3 语义冻结：AppDomain 的可访问集合（必须写进 spec）
+- [x] AppBinary：RX（禁止写）（v3+ 页表权限强制；v2 仍为软件校验）
+- [x] AppWorkspace（App:<name>）：只读数据（assets/config/manifest）-> RO（不提供 RW 映射）
+- [x] LAD:<name>：RW（应用唯一可持久写入域）
+- [x] Stack：RW
+- [x] AppApi trampoline 区：RX/RO（可选）
+- [x] 其它：不可访问
+
+验收（Stage 1）
+- [x] `app run hello` / `app run guess_number` 正常运行（见 `mmu selftest` / `app stress`）
+- [x] 任何伪造指针（越界）调用 AppApi 触发 Domain fault kill（统一为 `InvalidMemoryAccess`）
+- [x] 系统可进 shell，goes/view/app 等功能不回归
+  备注：v2 已把 AppDomain 的 region set 从“整段 APP_LOAD window”收紧为“实际加载段 + 栈”，避免 AppApi 指针检查退化成允许任意地址。
+  备注：`domain list/info` 已显示 asid/backend/region_count/pt_root，便于调试 AddressSpace 行为。
+
+================================================================================
+阶段 2：AArch64 页表基础设施（M1）
+--------------------------------------------------------------------------------
+2.1 AArch64 MMU 基础（只做 EL1 Stage-1 translation）
+- [x] 决定 granule：4KB（推荐，最通用）
+- [x] 定义页大小、对齐、页表项 flags（AP、UXN/PXN、AttrIndx、SH）
+- [x] 定义 MAIR_EL1（至少：Normal Cacheable + Device-nGnRE）（MAIR_EL1_MIN）
+- [x] 定义 TCR_EL1（TG0=4KB，IPS 合理设置，TTBR0 配置等）（TCR_EL1_MIN_TTBR0_48BIT）
+- [x] 提供 `mmu::is_enabled()`、`mmu::enable(mmu_cfg)`、`mmu::disable()`（骨架；默认不调用）
+  注：如果内核当前“早期禁用 MMU”但后续又用 identity mapping，请先搞清现在的内核地址模式。
+
+2.2 PageTable 数据结构（最小可用）
+- [x] 实现 L0/L1/L2/L3（4KB granule：典型 4-level）（骨架）
+- [x] 提供页表分配器：从内核 heap/专用 bump 分配 4KB 对齐页（骨架：heap alloc）
+- [x] 映射 API：
+  - [x] map_page(va, pa, flags)（骨架：4KB 页）
+  - [x] map_range(va, pa, len, flags)（骨架：4KB 页）
+  - [>] unmap_range(va, len)（v3+；v2 的 AppSpace 采用“构建->切换->销毁”模型）
+- [>] 支持 block mapping（1GB/2MB）（v3+ 性能优化；v2 仅 4KB 页映射，语义优先）
+
+2.3 AddressSpace -> PageTable Root
+- [x] KernelAddressSpace：记录现有内核页表 root（TTBR0，用于调试/回退）
+- [x] AppAddressSpace：每个 AppDomain 一棵独立页表 root（TTBR0_EL1）
+- [x] 实现 `addrspace::build_app_space(domain_layout) -> pt_root_pa`（v2/M1：仅用于 self-check，不切换 TTBR）
+
+2.4 AppDomain 内存布局（必须固定并打印）
+- [x] 约定 App VA layout（以当前实现为准，避免引入“路径语义”）：
+  - [x] aarch64：App window 0x4100_0000..0x4300_0000（含 AppBinary/stack/共享页；见启动日志 `mmu: app window map`）
+  - [x] x86_64：AppBinary 映射到 0x3000_0000..（页对齐拆分后映射；见 `mmu-appspace: map#8/#9/#10`）
+  - [>] ROData/Assets 专用映射区（v3+；v2 通过 AppApi + GOES_READ(App:<name>) 提供只读访问）
+- [x] 在 `app run` 时输出：每个段 VA/PA/len/flags（serial log；当前打印 PT_LOAD 段 + stack，VA==PA 假设；OAPP v1 段 flags 记为 unknown）
+
+验收（Stage 2）
+- [x] 构建 AppAddressSpace 后，进行自检：遍历关键 VA，确认 PTE 存在且 flags 正确（不切换；默认关闭以免影响启动）
+- [x] 仍可运行 hello/guess_number（切换开启前后均可运行；见 `mmu selftest`）
+- [x] 记录页表 root pa、页表层级数量、映射页数统计（selftest 打印 tables/pages；默认关闭）
+
+================================================================================
+阶段 2x：x86_64 页表基础设施（与 Stage 2 对齐）（X1）
+--------------------------------------------------------------------------------
+目标：在不引入 ring3 用户态的前提下，为 AppDomain 构建独立 x86_64 页表（PML4），
+并具备“切换 CR3 + 捕获 #PF -> Domain fault”的能力，语义与 AArch64 保持一致。
+
+2x.1 x86_64 paging 基础
+- [x] 明确分页模式：4-level paging（PML4/PDPT/PD/PT），4KB pages（MVP）
+- [x] 基础控制位（已在 `mmu status` 打印寄存器与位解释）：
+  - [x] CR0.PG / CR0.WP
+  - [x] CR4.PAE
+  - [x] EFER.LME/LMA/NXE
+- [>] PAT/Cache（v3+；v2 默认 WB；MMIO 仅按最小 device 窗口映射）
+
+2x.2 PageTable 数据结构（最小可用）
+- [x] 4KB 对齐页表结构：PML4/PDPT/PD/PT（每级 512 entries）
+- [x] 页表分配器：从内核 heap/专用 bump 分配 4KB（对齐）（当前为 heap alloc 骨架）
+- [x] 映射 API：
+  - [x] map_page_4k(va, pa, flags)
+  - [x] map_range_4k(va, pa, len, flags)
+  - [>] （可选）2MB huge page（v3+ 性能优化）
+
+2x.3 AddressSpace -> PageTable Root（CR3）
+- [x] KernelAddressSpace：保存/引用当前内核 CR3（仅记录，不切换；用于调试与后续切换）
+- [x] AppAddressSpace：每个 AppDomain 一个 PML4 root（物理地址用于 CR3）
+- [x] 实现 `addrspace::build_app_space_x86_64(domain_layout) -> cr3_root_pa`（已扩展 addrspace::build_app_space 到 x86_64）
+- [x] 自检：walk 页表，验证关键 VA 映射存在且 flags 正确（不切换；默认关闭）
+
+验收（Stage 2x）
+- [x] 构建 AppAddressSpace(x86_64) 后自检通过（不切换；默认关闭）
+- [x] 不影响现有 x86_64 启动与 shell
+
+================================================================================
+阶段 3：AddressSpace 切换（TTBR0）与 TLB 管理（M2）
+--------------------------------------------------------------------------------
+3.1 最小 AddressSpace Switch
+- [>] 为 AppDomain 分配 ASID（v3+；v2 不做 ASID，每次切换全 TLB flush）
+- [x] 提供：
+  - [x] enter_app_space(domain): 设置 TTBR0_EL1 / CR3 = app_pt_root（实现已存在；当前默认启用）
+  - [x] leave_app_space(): 恢复 TTBR0_EL1 / CR3（实现已存在；当前默认启用）
+- [x] 预留切换抽象：`mmu::switch::{enter_app_space, leave_app_space}`（当前启用，但仍保持最小实现）
+- [x] 切换前后插入必要屏障：
+  - [x] dsb ishst / isb（aarch64 已实现）
+  - [x] tlbi（无 ASID：tlbi vmalle1；aarch64 已实现；x86_64 CR3 切换自带 flush）
+
+3.2 执行路径接入
+- [x] 在 `app::call_app_entry` 进入应用前调用 enter_app_space（仅在开关开启时）
+- [x] 应用返回/kill 后调用 leave_app_space（仅在开关开启时）
+- [x] 任何 fault kill 都必须确保 leave_app_space 执行（依赖 abort_jmp 返回到 app run 的收尾路径）
+
+3.3 共享映射策略（MVP）
+- [x] AppApi 共享只读页：AddressSpaceLayout/selftest 已包含 AppApi 的 RO 映射（v3+ 切换时沿用）
+- [x] 设备 MMIO：仅映射最小窗口（framebuffer + virtio 必需 MMIO/ECAM），后续再按 capability+policy 进一步收敛
+
+验收（Stage 3）
+- [x] `app run hello` 正常执行（切换页表后还能回到 shell；见 `mmu selftest`）
+- [x] `domain list` / `audit` 仍可用
+- [x] 重复运行 100 次 app（见 `app stress`）
+
+================================================================================
+阶段 3x：x86_64 AddressSpace 切换（CR3）与 TLB（X1）
+--------------------------------------------------------------------------------
+3x.1 最小 AddressSpace Switch
+- [x] enter_app_space(domain): 保存旧 CR3，加载 app CR3（mov cr3, ...）
+- [x] leave_app_space(): 恢复 kernel CR3
+- [x] TLB：切换 CR3 自带 flush（MVP）；PCID 属于 v3+ 优化
+  注：x86_64 CR3 切换已落地，但仍需持续收敛共享映射面与回归测试。
+
+3x.2 执行路径接入
+- [x] 在 `app::call_app_entry` 进入应用前调用 enter_app_space（x86_64）
+- [x] 应用返回/kill 后调用 leave_app_space
+- [x] 任何 fault kill 必须确保 leave_app_space 执行（fault/trap restore 会先恢复 TTBR0/CR3）
+  - [x] 修复 x86_64 AppSpace 段权限“页对齐覆盖”问题：对 PT_LOAD 段做页边界拆分/合并，避免 ro 段覆盖 text 页导致 NX 被置位，CR3 切换后立即三重故障重启
+
+验收（Stage 3x）
+- [x] `app run hello` 正常执行（切换 CR3 后还能回到 shell；见 `mmu selftest`）
+- [x] 重复运行 100 次 app 不出现随机死机/卡死（见 `app stress`）
+
+================================================================================
+阶段 4：异常处理：Data Abort -> Domain fault（M2）
+--------------------------------------------------------------------------------
+4.1 AArch64 异常向量与处理框架（仅 EL1）
+- [x] 确认已有异常向量表；并为同步异常建立最小向量表入口（Current EL SPx Sync）
+- [x] 实现同步异常 handler（Data/Instr abort 等）并可在 AppDomain 下返回到 shell
+- [x] 读取 FAR_EL1（fault address）、ESR_EL1（异常原因）、ELR_EL1（返回地址）
+
+4.2 故障归因：判断“当前在 AppDomain 吗？”
+- [x] 从 sandbox/current_domain 获取 domain id
+- [x] 若 current_domain.kind == AppDomain：
+  - [x] 记录 fault：addr, esr, elr, access type（读/写/执行）
+  - [x] aarch64：在 abort trampoline 前恢复 kernel TTBR0（保证异常路径可继续运行）
+  - [x] 触发 sandbox::fault(FaultKind::InvalidMemoryAccess)（v2 暂用统一 fault；v3+ 可细分 PageFault/AccessViolation）
+  - [x] kill/restart policy 按 FaultPolicy 执行（当前默认 Kill）
+  - [x] 返回到 shell（通过 abort_jmp + trap/ISR 修改返回值）
+- [x] 若 current_domain 为 Kernel/Shell：
+  - [x] 暂按 fatal 处理（spin）；v3+ 再统一到 panic/Recovery
+
+4.3 App 死循环/超时与页表配合
+- [x] watchdog 超时触发 kill 时，确保能安全切回（当前未切页表，但已保证返回到 shell 的返回码链路正确）
+- [x] 中断/计时器上下文返回码写入 trap frame（避免“写 x0 被恢复覆盖”导致卡死）
+
+验收（Stage 4）
+
+--------------------------------------------------------------------------------
+阶段 4x：x86_64 异常归因：#PF/#GP/#UD -> Domain fault（X1 前置，非 CR3 切换）
+--------------------------------------------------------------------------------
+目标：
+- 在不切换 CR3、不引入 ring3 的前提下，让 AppDomain 的典型硬件异常不再拖死系统：
+  - #PF / #GP / #UD 发生时，归因到 AppDomain 并返回到 app run（abort_jmp），最终回到 shell
+- Kernel/Shell 触发这些异常仍按 fatal 处理（避免掩盖内核 bug）
+
+完成情况：
+- [x] #PF 归因到 AppDomain -> Domain fault -> abort return (-3)
+- [x] #GP 归因到 AppDomain -> Domain fault -> abort return (-3)
+- [x] #UD 归因到 AppDomain -> Domain fault -> abort return (-3)
+- [x] 专门做一个恶意 app：`fault_read` / `fault_write`（读/写 0x1）-> 触发 fault -> Domain fault -> kill
+- [x] Shell 不死，系统可继续运行其它 app
+- [x] 审计日志记录 fault（domain id + addr + reason）（boot 阶段缓冲，shell ready 后 flush）
+
+================================================================================
+阶段 4x：异常处理：#PF -> Domain fault（x86_64）（X1）
+--------------------------------------------------------------------------------
+4x.1 #PF handler
+- [x] 确认已有 IDT/GDT 与异常框架；建立最小 #PF handler
+- [x] 读取 CR2（fault address）、error_code、RIP（返回地址）（已在 serial 日志打印）
+
+4x.2 故障归因：判断“当前在 AppDomain 吗？”
+- [x] 若 current_domain.kind == AppDomain：
+  - [x] 记录 fault：cr2/rip/err_code（serial）
+  - [x] 触发 sandbox::fault(FaultKind::InvalidMemoryAccess) 并通过 abort trampoline 回到 shell
+  - [x] （已实现）若启用 CR3 切换：在 #PF/#GP/#UD/timeout 触发 abort 前恢复 kernel CR3
+- [x] 若 Kernel/Shell：按 panic（系统 bug）
+
+验收（Stage 4x）
+- [x] fault_read / fault_write 触发 #PF/#GP/#UD -> Domain fault kill
+- [x] Shell 不死，系统可继续运行其它 app
+
+================================================================================
+阶段 5：权限与 W^X 强化（M3）
+--------------------------------------------------------------------------------
+5.1 页权限严格化（必须）
+- [x] AppBinary：RX（按 ELF p_flags / OAPP v2 flags 映射；禁止写）
+- [x] AppROData：RO（按 ELF p_flags 映射；禁止写；OAPP v1 使用保守 heuristic）
+- [x] LAD：RW，默认 NX（GOES 语义：仅允许写 LAD:<app>；内存默认 NX）
+- [x] stack/heap：RW，默认 NX
+- [x] 禁止任何 RWX 页（内核段拆分映射 + 段 flags；遇到 W|X 强制 NX 并拒绝 RWX map）
+
+5.2 写路径与 Workspace 语义对齐
+- [x] App 只能 GOES_WRITE 到 LAD:<app>（`sandbox::check_goes_write` 对 AppDomain 强制）
+- [x] App:<app> 只读语义：AppDomain 仅持有 GOES_READ(App:<name>)，无 GOES_WRITE；App 包数据不做额外映射，仅通过 AppApi 只读读取
+
+5.3 最小共享区（可选）
+- [x] 只读共享页：版本字符串、cap summary、只读 API 表（见 `kernel/src/mmu/addrspace.rs:init_shared_ro_page`）
+- [x] 明确：共享区不含任何可写指针（内容仅 ASCII 文本 + 固定偏移）
+
+验收（Stage 5）
+- [x] 运行所有示例 app 通过（`mmu selftest` 会运行 fault_*）
+- [x] 强测：尝试自修改代码（写 text 段）-> abort -> kill（`fault_text`）
+- [x] 强测：执行 LAD 数据页 -> abort -> kill（`fault_exec`）
+
+================================================================================
+阶段 6：稳定性、恢复与回归（M4）
+--------------------------------------------------------------------------------
+6.1 Recovery 兼容
+- [x] 即使 App 包损坏/页表构建失败，也必须可进 shell
+- [x] 页表构建失败 -> 不 panic（serial 记录 build failed；不会阻塞 shell）
+- [x] 在 recovery 模式下禁用 app run（shell 侧拒绝并提示）
+
+6.2 TLB/ASID 健壮性
+- [>] 若使用 ASID：实现 ASID 分配/回收（v3+）
+- [x] 若不使用 ASID：每次切换严格全 flush（aarch64: `tlbi vmalle1`；x86_64: CR3 flush）
+- [x] 加入 debug 统计：tlb flush 次数、切换次数（`mmu status` + switch/tlbi counters）
+
+6.3 回归测试清单（手动/脚本均可）
+- [x] 反复 app run / stop / kill（新增 `app stress <name> <count>`）
+- [x] 反复进入/退出 workspace、goes view 查询（`mmu selftest` 已覆盖）
+- [x] 触发 fault 100 次后 shell 仍稳定（`mmu selftest` 已覆盖）
+- [x] 低内存压力测试（heap 逼近上限，`mmu selftest` 尝试 12MiB reserve/resize）
+
+验收（Stage 6）
+- [x] 通过上述回归清单（以 `mmu selftest` + `app stress` 为准）
+- [x] serial log 无“随机卡死/无法回 shell”问题（重点观察：fault kill / timeout kill 后可回 shell）
+
+================================================================================
+阶段 7：性能与未来扩展预留（M5，不要求本轮全做）
+--------------------------------------------------------------------------------
+7.1 最小 heap 映射策略
+- [>] 为 AppDomain 提供固定大小 heap（v3+；v2 先用固定栈 + 内核分配缓冲）
+- [>] 或一次性映射整段 heap（v3+；当前不做避免扩大映射面）
+
+7.2 未来：SystemServiceDomain 独立 AddressSpace（预留）
+- [>] v3+：SystemServiceDomain 独立页表（接口预留，当前不实现）
+
+7.3 未来：共享内存/IPC（预留）
+- [>] v3+：共享内存/IPC（接口预留 map_shared_ro/map_shared_rw，默认禁用）
+
+================================================================================
+Shell / 工具验收命令建议（贯穿全程）
+------------------------------------------------------------------------------
+- app run hello
+- app run guess_number
+- domain list
+- goes status / goes ls / goes view run roots
+- audit show（如果有）
+- （新增）mmu status / mmu test（建议加一个 debug 命令打印：
+  - mmu enabled?
+  - current TTBR0 root
+  - current domain + addressspace kind
+  - 映射统计）
+  实现状态：
+  - [x] `mmu status`（打印 domain/asid/pt_root；aarch64: enabled/ttbr0/tcr/mair；x86_64: paging/cr3/efer）
+
+附：故障注入 App（建议做两个小 app）
+------------------------------------------------------------------------------
+- app_bad_read：读未映射 VA，验证 Data Abort -> fault kill
+- app_bad_write：写 RX/RO 页，验证 Access violation -> fault kill
+
+完成定义（Definition of Done）
+------------------------------------------------------------------------------
+- AppDomain 在 EL1 下运行，但拥有独立页表隔离
+- App 任何非法内存访问都不会影响 shell 与系统服务
+- 页权限满足 W^X（无 RWX）
+- 语义与 capability/policy 对齐：App 仅能写 LAD；App 包只读
+- 全流程可编译、可启动、可回归复现
+
+================================================================================
+附：x86_64 特性开关建议（X2，按硬件/QEMU 可用性）
+--------------------------------------------------------------------------------
+说明：这些都是“同特权级（ring0）执行”的安全强化，不引入用户态。
+
+- [x] NX（EFER.NXE）：支持 NX 位（当前状态可在 `mmu status` 查看；是否强制启用由 `enable_wx_protection` 决定）
+- [x] WP（CR0.WP）：支持 supervisor write-protect（当前状态可在 `mmu status` 查看）
+- [>] SMEP（CR4.SMEP）（v3+；需要 U/S 语义或更严格执行域划分）
+- [>] SMAP（CR4.SMAP）（v3+；同上）
+- [>] PCID（CR4.PCIDE）（v3+ 性能优化）

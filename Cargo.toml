@@ -1,0 +1,14 @@
+[workspace]
+members = ["kernel", "bootloader", "xtask", "boot-proto"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["oneOS contributors"]
+
+[workspace.dependencies]
+uefi = { version = "0.36", default-features = false, features = ["logger", "global_allocator", "alloc"] }
+spin = "0.9"
+oneos-boot-proto = { path = "boot-proto" }

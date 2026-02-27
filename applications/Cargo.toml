@@ -1,0 +1,18 @@
+[workspace]
+members = [
+  "sdk/oneos-app",
+  "hello",
+  "guess_number",
+  "chatbot",
+  "fault_read",
+  "fault_write",
+  "fault_text",
+  "fault_exec"
+]
+resolver = "2"
+
+# Cold-start performance: smaller shipped binaries reduce guest I/O and load time.
+# We use thin LTO as a good size/speed trade-off for host build time.
+[profile.release]
+lto = "thin"
+codegen-units = 1

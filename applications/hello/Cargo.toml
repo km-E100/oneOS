@@ -1,0 +1,14 @@
+[package]
+name = "oneos-app-hello"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+oneos-app = { path = "../sdk/oneos-app" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+

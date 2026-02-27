@@ -1,0 +1,50 @@
+oneOS 构建与运行（v1）
+=====================
+
+前置准备
+- 安装 nightly：`rustup toolchain install nightly`
+- 安装 targets：
+  - `rustup target add x86_64-unknown-uefi aarch64-unknown-uefi`
+  - `rustup target add x86_64-unknown-none aarch64-unknown-none-softfloat`
+- 安装 QEMU + EDK2/OVMF 固件（以下示例为 Homebrew 默认路径）
+
+构建（推荐 xtask）
+- 双架构构建：`cargo run -p xtask -- build`
+- 仅 aarch64：`cargo run -p xtask -- build --arch aarch64`
+- 仅 x86_64：`cargo run -p xtask -- build --arch x86_64`
+
+生成镜像（ESP + GOES）
+- 生成 `dist/oneos-esp.img` + `dist/oneos-goes.img`：
+  - `cargo run -p xtask -- install`
+- 生成并创建 admin（无密码，仅测试）：`cargo run -p xtask -- install --admin`
+- 需要重写 System（Recovery + SIP OFF）：`cargo run -p xtask -- install --admin --recovery --sip-off`
+- 安全更新（不重写 System）：`cargo run -p xtask -- install --update`
+  - 说明：`--update` 会原地刷新 GOES 内核 slot，并在 record log 追加一条 installer stamp
+  - 若你要在“已存在的 GOES 镜像”上设置 `--admin`，因为会修改 default_user（System），必须加：`--recovery --sip-off`
+
+内置应用（v1）
+- 仓库根目录 `applications/` 是“系统自带应用的源码/包描述层”（不属于 `kernel/`）。
+- `xtask install` 会扫描 `applications/*/manifest.toml` 并把每个应用打包为 `App:<name>` Workspace：
+  - `Applications` Workspace：仅写入 registry（name -> App:<name>）
+  - `App:<name>` Workspace：包含 `AppManifest` / `AppConfig` / `AppBinary`
+
+运行（QEMU，带窗口）
+- aarch64：
+  `cargo run -p xtask -- run --arch aarch64 --firmware /opt/homebrew/share/qemu/edk2-aarch64-code.fd --display cocoa --mem 1024`
+- x86_64：
+  `cargo run -p xtask -- run --arch x86_64 --firmware /opt/homebrew/share/qemu/edk2-x86_64-code.fd --display cocoa --mem 1024`
+
+Shell 验收（v1）
+- 查看 Workspace：`goes manifest`
+- 列出已安装 App（Applications=registry）：`app list`
+- 查看 App 信息（从 App:<name> 读取 manifest/config）：`app info hello`
+- 运行 App（第5阶段：加载 ELF 并打印 entry/segments，不执行）：`app run hello`
+
+Windows 提示
+- Windows 下 `--display cocoa` 不可用，改用 `--display sdl`（或 `--display auto`）。
+
+
+
+
+
+qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024 -serial stdio -monitor none -display cocoa -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd -device ramfb -device virtio-keyboard-pci,bus=pcie.0,addr=0x5 -drive format=raw,file=/Users/zhangjunyi/Desktop/编程/Operating\ System/oneOS/oneOS/dist/oneos-esp.img -drive if=none,file=/Users/zhangjunyi/Desktop/编程/Operating\ System/oneOS/oneOS/dist/oneos-goes.img,format=raw,id=goes -device virtio-blk-pci,drive=goes,bus=pcie.0,addr=0x6 -d 'trace:virtio*,trace:virtqueue*,guest_errors' -D qemu-virtio.log -s -S

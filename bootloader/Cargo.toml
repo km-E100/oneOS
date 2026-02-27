@@ -1,0 +1,16 @@
+[package]
+name = "oneos-bootloader"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "oneos-bootloader"
+path = "src/main.rs"
+
+[dependencies]
+uefi = { workspace = true, features = ["logger", "global_allocator"] }
+spin = { workspace = true }
+oneos-boot-proto = { workspace = true }
+
+[features]
+default = []

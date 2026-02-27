@@ -1,0 +1,11 @@
+[package]
+name = "fault_exec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+oneos-app = { path = "../sdk/oneos-app" }
+
+[profile.release]
+panic = "abort"
+

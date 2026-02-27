@@ -1,0 +1,25 @@
+[target.aarch64-unknown-uefi]
+rustflags = [
+    "-C", "link-arg=/Subsystem:EFI_Application",
+]
+
+[target.x86_64-unknown-uefi]
+rustflags = [
+    "-C", "link-arg=/Subsystem:EFI_Application",
+]
+
+[target.aarch64-unknown-none-softfloat]
+rustflags = [
+    "-C", "link-arg=--gc-sections",
+    "-C", "link-arg=-static",
+]
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "link-arg=--gc-sections",
+    "-C", "link-arg=-static",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-no-pie",
+    # Kernel code enables interrupts; disable the SysV red zone to avoid IRQ stack corruption.
+    "-C", "no-redzone",
+]

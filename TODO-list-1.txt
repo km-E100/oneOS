@@ -1,0 +1,180 @@
+oneOS TODO List（优先把 Shell 做完整；双镜像：ESP(oneboot)+GOES(system)）
+==============================================================================
+
+目标验收（最终效果）
+------------------------------------------------------------------------------
+1) 产物一：ESP（只负责引导）
+   - dist/oneos-esp.img（FAT，UEFI 可直接加载）
+   - 同时保留目录产物：dist/esp-x86_64 与 dist/esp-aarch64（或 dist/universal）
+   - 仅包含 UEFI 引导相关文件：EFI/Boot/BOOTX64.EFI、EFI/Boot/BOOTAA64.EFI（oneboot）
+   - 可选：EFI/oneOS/oneboot.cfg（最小配置，仅 debug/开关）
+
+2) 产物二：GOES 主分区镜像（系统世界）
+   - dist/oneos-goes.img（raw block image，自定义 GOES 格式）
+   - 内含 Workspace: System / Library / Applications / Users
+   - System Workspace 内至少包含 BootManifest + KernelImage（按架构）等“系统本体对象”
+
+3) 启动链
+   - UEFI -> ESP(oneboot) -> 扫描/识别 goes.img -> 读取 BootManifest -> 加载 raw kernel -> 进入内核 shell
+   - x86_64 与 aarch64 都可启动
+
+4) Shell（忽略 RN 与 GUI 桌面，仅做内核交互）
+   - framebuffer 文本输出（已有）+ 键盘输入（virtio-keyboard，x86_64/aarch64 都可）
+   - 行编辑：逐字回显、退格、换行、Tab(先空格/忽略)、缓冲溢出处理
+   - 命令：help/echo/arch/clear/panic/halt/mem/goes/ws/whoami/reboot(可先 stub)
+   - prompt 支持上下文：oneOS[System]> / oneOS[User:admin]>（先字符串/状态占位）
+
+5) xtask
+   - 增加 --admin 参数：启用时自动写入一个 admin 账户（无密码，仅测试），并设置默认用户为 admin
+   - 运行命令自动挂载 goes.img（ESP 仍保持 FAT，GOES 作为第二块盘）
+
+
+里程碑（按顺序实现，保证每一步可编译可验证）
+------------------------------------------------------------------------------
+M1. Shell “可用且好用”（不依赖 GOES）
+M2. GOES v0.1 磁盘格式 + host 写入器（生成 goes.img）
+M3. oneboot 从 GOES 读取 KernelImage 并启动（双架构）
+M4. 内核侧 GOES 只读探测 + shell 命令 goes/ws/whoami 可用
+M5. xtask --admin 生效：默认进入 User:admin（无密码，仅测试）
+M6. Recovery + SIP 预留：BootFlag + 连续失败计数 + SIP 开关状态机（先留接口/文件格式，后续实现）
+
+
+第 1 阶段：Shell 完整化（内核侧，优先）
+------------------------------------------------------------------------------
+1.1 Console 抽象（结构优先）
+- [x] 定义 console 模块：ConsoleOut/ConsoleIn/KeyEvent（统一接口）
+- [x] ConsoleOut 实现：framebuffer 文本（display）作为默认输出
+- [x] ConsoleIn 实现：virtio keyboard（可用则用）否则串口（raw）/UEFI stdin（uefi）
+- [x] 统一换行策略：内部 '\n'，串口输出 CRLF；framebuffer 直接 LF
+- [x] 为终端日志保留独立通道：serial::log_line*（只写串口，不污染窗口）
+
+1.2 行编辑（单行输入 + 回显 + 退格）
+- [x] 固定缓冲区（例如 256/512）
+- [x] 逐字回显（字符画到 framebuffer）
+- [x] 退格（擦除字符；跨行回退可先不做但要稳定）
+- [x] Enter 执行
+- [x] Tab（先插入 4 个空格或忽略）
+- [x] 超长输入：提示并截断/拒绝（不可死循环/不可写越界）
+
+1.3 命令注册与执行框架
+- [x] Command 表：name/usage/help/handler
+- [x] 自动 help（从注册表生成）
+- [x] 统一错误输出：unknown command / invalid args
+- [x] prompt 与上下文（workspace/user）解耦为一份 ShellContext
+
+1.4 命令集（v0.2）
+- [x] help：列出命令
+- [x] echo <txt>：回显
+- [x] arch：打印 arch::arch_name()
+- [x] clear：清屏
+- [x] panic：触发 panic（测试 panic）
+- [x] halt：arch::halt()
+- [x] mem：打印内存概要（boot info region count/total/usable）
+- [x] goes status：先 stub（后续接真实 GOES reader）
+- [x] goes ls：先 stub（后续列 System roots 等）
+- [x] ws list：先 stub（后续列 System/Users/Applications + 用户 ws）
+- [x] ws enter <name>：先 stub（切 prompt）
+- [x] whoami：先 stub（显示当前用户，后续由 GOES 决定）
+- [x] reboot：先 stub（后续实现 reset）
+
+验收：x86_64/aarch64 raw kernel 进入 shell，键盘可输入 help，输出稳定。
+
+
+第 2 阶段：GOES v0.1 格式（先可写可读可校验）
+------------------------------------------------------------------------------
+2.1 GOES on-disk（最小可启动闭环）
+- [x] Superblock（固定位置，4KiB 对齐）（已写入，v0.1）
+  - magic="GOES"、version、uuid、block_size、features、checkpoint_ptr、backup_checkpoint_ptr、crc
+- [x] Checkpoint（固定/指针位置）（v0.1：指向 BootManifest，可切换 active_set）
+  - 指向 BootManifest 位置（或 ObjectTable 根），含 seq/crc
+- [x] Record（append-only）（v0.1：写入 RecordLog，包含 BootManifest/Workspaces/KernelRefs/Edges）
+  - RecordHeader：type/len/seq/crc（Object/Edge/Event 先占位 payload）
+- [x] Index（最小索引）（v0.1：先不做独立区，后续由 record 重放构建）
+  - ObjectTable/EdgeTable 先留结构，v1 实现
+- [x] Checkpoint 双写与 CRC（v0.1：单 checkpoint + crc，双写后续）
+
+2.2 Host 侧写入器（xtask）
+- [x] 生成 oneos-goes.img（写入 Superblock/Checkpoint/Manifest/BootManifest/RecordLog）
+- [x] BootManifest active_set 可切换（xtask goes set-active + bootloader 读取）
+- [x] goes show 能解析并打印关键信息（校验 crc）
+
+2.3 SIP/Recovery 基础规则（v0.1）
+- [x] SIP flags（bit1=ON，默认 ON）
+- [x] xtask 在显式 recovery 前提下允许切换 SIP（goes set-sip）
+- [x] install 写入策略：默认拒绝写 System；recovery+sip-off 才允许覆盖
+
+验收：host 能生成 oneos-goes.img，能解析 Superblock/Checkpoint，记录可校验。
+
+
+第 3 阶段：oneboot 从 GOES 启动内核（ESP 仅引导）
+------------------------------------------------------------------------------
+3.1 oneboot（UEFI 引导器职责）
+- [x] BlockIO 枚举所有块设备
+- [x] 识别 GOES：扫描前若干 block，匹配 Superblock.magic（v0.2 先不做 GPT type GUID）
+- [x] 读取 Checkpoint/BootManifest，定位 KernelImage（按 arch 选择）（v0.1：按 active_set 选择）
+- [x] 加载 raw kernel（ELF）
+  - x86_64：注意 SysV ABI 传参（RDI），保留 trampoline
+  - aarch64：按现有方式
+- [x] 传入扩展 BootInfo（预留 GOES 信息：device_id/superblock_lba/system_ws_id 等）（v0.1：device_id=UEFI media_id，superblock_lba=0，system_ws_id=1 占位）
+
+3.2 QEMU 挂盘策略（不破坏 ESP）
+- [x] ESP：fat:rw:dist/esp-*（存在 oneos-esp.img 时优先使用镜像）
+- [x] GOES：作为第二块盘挂载（优先 virtio-blk；oneos-goes.img）
+
+验收：两架构均能从 GOES 读取 KernelImage 并进入内核 shell（不再依赖 ESP 中的 KERNEL*.BIN）。
+
+
+第 4 阶段：内核侧 GOES 只读（为 shell 提供真实信息）
+------------------------------------------------------------------------------
+4.1 块设备访问（先 virtio-blk）
+- [x] virtio-blk（polled，read-only 起步）
+- [x] 提供 read_at(offset, buf) 接口给 GOES reader
+
+4.2 GOES reader（只读）
+- [x] probe_superblock() / read_checkpoint()
+- [x] 解析 BootManifest / Workspace 列表（v0.1：Workspace 列表已从 manifest 读取）
+- [x] 提供 shell 命令 goes status/goes ls/ws list/whoami 的数据来源（v0.1：基于 manifest）
+
+验收：shell 的 goes/ws 命令不再 stub，能显示 System/Users/Applications；能显示默认用户。
+
+
+第 5 阶段：xtask 增强（--admin + install 链路）
+------------------------------------------------------------------------------
+5.1 xtask 新命令与参数
+- [x] xtask install：生成/更新 oneos-esp.img 与 oneos-goes.img（写入 System/Users/Applications + KernelImage + BootManifest）
+- [x] xtask run：自动挂载 oneos-esp.img + oneos-goes.img（x86_64/aarch64）
+- [x] xtask --admin：启用时在 goes.img 内创建 admin（无密码，仅测试），并设置为默认用户（v0.1：manifest 占位）
+- [x] Windows 主机支持：install 不依赖外部 mtools/qemu-img；run 支持 display=sdl；firmware 路径通过 env/参数配置
+
+5.2 --admin 写入内容（GOES 内）
+- [x] AccountObject(name="admin", password=None, flags:admin=true)（v0.1：以 Record(type=5) 写入，后续替换为真实 ObjectID）
+- [x] WorkspaceObject(name="User:admin")（v0.1：以 Record(type=6) 写入）
+- [x] Edge：Users contains User:admin；User:admin owns AccountObject（v0.1：EdgeList 里用名字表达关系）
+- [x] DefaultUser 指针/edge（System -> default_user -> User:admin）（v0.1：同时写入 superblock/manifest/bootmanifest 的 default_user）
+
+5.3 install 写入策略（与 SIP/Recovery 兼容）
+- [x] 默认写入 Library/Applications/Users（正常升级路径；v0.1：`--update` 仅追加 Record(type=7) 作为“安全更新”占位，不改 System 数据）
+- [x] 写入 System 必须显式标志（例如 install --recovery --sip-off），否则拒绝
+
+验收：开启 --admin 时，启动默认进入 oneOS[User:admin]>，whoami 显示 admin。
+
+
+第 6 阶段：Recovery 预留（先留结构与接口）
+------------------------------------------------------------------------------
+- [x] BootFlag（ForceRecovery）存放位置：ESP 小文件（v0.x：`\\EFI\\ONEOS\\BOOTFLAG.BIN`，oneboot 读取后自动清除；xtask 提供写入）
+- [x] PanicRecord/BootState（ring buffer，连续失败计数）（v0.x：`\\EFI\\ONEOS\\BOOTSTAT.BIN`；支持 ring[8] + failures；可用 xtask 写入模拟）
+- [x] SIP 状态存储：ESP/GOES Policy（v0.x：ESP `\\EFI\\ONEOS\\SIP.BIN` 作为显示/覆盖来源；GOES flags 仍保留，后续统一到 System Policy）
+- [x] oneboot 启动时检查：>=3 次失败进入 recovery shell（v0.x：基于 BootState.failures）
+- [x] Recovery shell（oneOS[recovery]>）：只暴露安全命令（v0.x：在内核 shell 中限制命令集；写操作相关命令暂留 stub/host 工具）
+
+验收：可手动 ForceRecovery 进入 recovery prompt；连续失败计数逻辑可用（可先通过人工写入模拟）。
+
+
+执行纪律（必须遵守）
+------------------------------------------------------------------------------
+- 入口不写业务：UEFI entry 只做转发；oneboot 只做交接/加载/决策。
+- arch 隔离：ISA/端口 I/O/MMIO 只在 arch 或 drivers 内，不散落到 shell/goes。
+- 输出路径单一：用户可见输出走 console/text；调试日志走 serial::log_line。
+- 每个里程碑都要“可编译、可运行、可验证”，不追求一次性做完全部。
+- [x] ESP 引导镜像命名统一为 oneos-esp.img（通常位于 dist/oneos-esp.img，内部仍是 FAT 结构）
+- [x] GOES：作为第二块盘挂载（优先 virtio-blk），镜像文件名 oneos-goes.img

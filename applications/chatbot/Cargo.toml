@@ -1,0 +1,14 @@
+[package]
+name = "oneos-app-chatbot"
+version = "0.1.0"
+edition = "2021"
+
+# This crate is built as a oneOS application.  It must be compiled
+# with `no_std` and cannot rely on the standard library.  The only
+# external crate we depend on is `oneos_app`, which provides access
+# to the oneOS console API and the watchdog.  Do not add other
+# dependencies here: the oneOS runtime does not bundle a Rust
+# standard library or allocator.
+
+[dependencies]
+oneos_app = { package = "oneos-app", path = "../sdk/oneos-app", default-features = false }

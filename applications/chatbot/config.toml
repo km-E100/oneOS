@@ -1,0 +1,14 @@
+## Chatbot configuration.
+## The fields here are loaded by the application at startup if
+## desired.  For simplicity the current implementation embeds all
+## behaviour in code, but future iterations could read these values
+## and adjust accordingly.
+
+# bot_name is the friendly name the chatbot uses when introducing
+# itself.  Changing this value will update the greeting message.
+bot_name = "FriendlyBot"
+
+# max_topics defines how many things the bot will remember when the
+# user tells it about their interests using phrases like "i like ...".
+# Once this limit is reached new topics will not be stored.
+max_topics = 5

@@ -1,0 +1,222 @@
+oneOS v1 TODO List（核心系统阶段：GOES → 权限 → 应用 → 图形能力）
+==============================================================================
+
+说明
+------------------------------------------------------------------------------
+- 本文件是 v1 开发计划（在 v0.x 基础上前进），旧的 v0.x TODO 已归档为 `TODO-list-1.txt`。
+- 严格遵守：不推翻 v0.x 架构、不引入桌面/UI/RN/网络、不引入 async/多线程；v1 全同步。
+- 运行模型：oneOS 采用“纯内核态 + Sandbox Domain”，隔离语义由 Domain + Capability + Policy 强制（不是传统用户态/内核态）。
+- 优先级不可更改：GOES 写路径 → View 查询 → 用户/权限 → 应用生命周期 → GPU 绘制能力（底层）。
+
+v1 目标验收（必须通过 shell 验证）
+------------------------------------------------------------------------------
+GOES
+- goes ls / goes stat：返回真实数据（来自 GOES reader + 重放索引）
+- goes view list/run：View 查询可用（roots/edges/type/按 seq 排序）
+- 所有写操作走 append-only log；崩溃后可重放恢复（忽略半条 record）
+
+权限
+- whoami：返回真实 AccountObject 信息（username/admin/home ws/disabled）
+- Users Workspace：只能写自己的 User:<name>
+- Library：admin 可写，normal 只读
+- Applications：admin install/remove，normal run
+- System：Normal 只读；Recovery + SIP OFF 才可写（必须强制执行）
+- 权限失败返回明确错误（不 panic）
+
+应用
+- app list/info/install/run/stop/remove 可演示（单进程、无 IPC、无多实例）
+- “运行应用”在 User context 下启动（User->App references）
+
+图形能力（仅底层）
+- gfx info：打印当前 GraphicsDevice 信息
+- gfx test：能画色块/线条/矩形（不做窗口/桌面/控件）
+
+
+里程碑（按顺序实现，保证每一步可编译可运行）
+------------------------------------------------------------------------------
+V1-M0. 基线保持：v0.x 启动链稳定（双架构 + shell + GOES v0.1 读取）
+V1-M1. Domain + CapabilityTable（最小实现）：资源访问必须通过 capability（先做到 GOES_WRITE / GPU_DRAW）
+V1-M2. GOES v1 Write Path（内核侧）：append-only writer + 最小 record 集 + 重放
+V1-M2. GOES v1 View 查询：最小查询执行器 + shell 命令升级
+V1-M3. 用户与权限模型：AccountObject 真正落地 + Workspace 权限边界
+V1-M4. 应用生命周期：Applications Workspace + App 对象模型 + 生命周期命令
+V1-M5. GPU 绘制能力：GraphicsDevice 抽象 + gfx test
+
+
+第 0 阶段：基线与防回归
+------------------------------------------------------------------------------
+0.1 启动/构建基线（必须常绿）
+- [ ] `cargo run -p xtask -- install --admin --recovery --sip-off` 可成功生成 `dist/oneos-esp.img` + `dist/oneos-goes.img`
+- [ ] `cargo run -p xtask -- run --arch aarch64 --display cocoa --mem 1024` 进入 shell
+- [ ] `cargo run -p xtask -- run --arch x86_64 --display cocoa --mem 1024` 进入 shell
+
+0.2 Recovery 基线（第 6 阶段已完成，v1 继续沿用）
+- [ ] `cargo run -p xtask -- esp force-recovery --state on` 后启动应进入 `oneOS[...|recovery]>`
+- [ ] `cargo run -p xtask -- esp set-failures --count 3` 后启动应进入 recovery
+
+
+第 0.5 阶段：Domain + CapabilityTable（v1 基础设施，必须先落地）
+------------------------------------------------------------------------------
+0.5.1 Domain 模型（最小三类）
+- [x] KernelDomain / SystemServiceDomain / AppDomain 三类 Domain 结构落地（ID/Owner/WorkspaceScope/CapabilitySet/FaultPolicy）
+- [x] v1 先做 “Domain + 单任务” 模型：当前系统仅有 KernelDomain + ShellServiceDomain（占位）
+
+0.5.2 CapabilityTable（能力句柄）
+- [x] 内核维护 CapabilityTable（外部只能持有 handle/令牌，不可伪造）
+- [x] 最小 cap_type：
+  - [x] GOES_READ / GOES_WRITE（带 workspace scope；GOES writer 已强制走 `require_goes_write`）
+  - [x] CONSOLE（可选，占位）
+  - [x] GPU_DRAW（v1 给 KernelDomain + ShellServiceDomain（仅 debug：`gfx info/test`），AppDomain 不发放）
+- [x] 统一校验入口：所有服务函数必须验证 domain + cap + 参数边界（v1 先实现 cap 校验骨架；先落地 GOES_WRITE）
+
+0.5.3 Fault vs Panic（行为约束）
+- [x] Domain fault（越权/非法 cap/非法指针）：按 FaultPolicy kill/restart（v1 先实现 kill：`sandbox::fault()` 记录日志并 halt）
+- [x] 内核 panic：系统级（维持现有 panic 输出，计入 boot failures）
+
+
+第 1 阶段：GOES v1 写路径（最优先）
+------------------------------------------------------------------------------
+1.1 块设备写入能力（内核侧）
+- [x] virtio-blk：增加 write_at(offset, buf)（同步、轮询；最小可用）
+- [x] 写入对齐策略：允许非对齐写（内部读-改-写 512B 扇区；v1 先这样）
+- [x] 失败语义：提供 Result API，不 panic（新增 `virtio::blk::{read_at_res,write_at_res}`；GOES 侧已迁移使用）
+
+1.2 RecordWriter（append-only）
+- [x] `goes::writer::append_record(record_type, payload)`：自动 seq 单调递增 + CRC32
+- [x] crash-safe：允许半条 record（重放时能检测并忽略；CRC 失败即停止）
+- [x] fsync 语义：写入后确保“设备请求已完成”（v1：同步写+轮询完成；flush/feature 以后补）
+
+1.3 v1 最小 record 类型（内核侧）
+- [x] CreateObjectRecord（v1 简化：ObjectID/Type/Workspace/Name；ObjectID=seq）
+- [x] UpdateObjectMetaRecord（v1：支持更新 name/type/workspace；重放可见；`goes meta` 可写入）
+- [x] AddEdgeRecord（v1 简化）
+- [x] RemoveEdgeRecord（v1 简化）
+- [x] CreateWorkspaceRecord（v1：可写入与重放；`goes mkws` 可写入）
+- [x] UserAccountRecord（创建/禁用/flags/home ws；v1 record + 兼容 v0.1 record；`goes mkuser` 可写入）
+- [x] UpdateBootManifestRecord（v1：以 append-only record 记录 active_set/default_user 变更，后续章节接入 oneboot/Checkpoint）
+
+1.4 写路径规则（强制执行）
+- [x] System Workspace：Normal 拒绝写（返回权限错误；Capability + SIP 双重强制）
+- [x] System Workspace：Recovery + SIP OFF 才允许写（BootInfo + SIP flag 判定；cap 只在该态发放）
+- [x] Library/Applications/Users：允许写（受用户/角色权限控制，见第 3 阶段；已强制）
+
+1.5 重放与索引（v1 最小）
+- [x] 启动时：Superblock + 从 record log 重放构建最小索引（ObjectTable/EdgeTable，内存）
+- [x] 索引结构：先内存 BTree/Vec（依赖 heap bump allocator），不做持久化 index area
+- [x] 只实现 redo（不做 undo/compaction/GC）
+
+Shell 验收命令（v1.0）
+- [x] `goes mkobj ...`（创建对象）/ `goes addedge ...` / `goes rmedge ...`
+- [x] `goes ls` 能看到新增对象（通过重放索引）；`goes edges <id>` 查看边
+
+
+第 2 阶段：GOES v1 View 查询（Query Engine）
+------------------------------------------------------------------------------
+2.1 ViewObject 定义（最小，不是 SQL）
+- [x] source_ws（workspace）
+- [x] filters：type / edge / owner（v1：type/out/in/owner）
+- [x] order：by seq（默认），可选 name/time（v1：实现 seq asc/desc）
+- [x] limit（可选）
+
+2.2 Query 执行器
+- [x] `run_view(view_id, ctx) -> iterator/Vec<ObjectRef>`（v1：实现 `goes::view` 执行器，shell 通过 ViewObject 调用）
+- [x] 必须支持：
+  - [x] 列出某 Workspace 的根对象（当前 workspace objects）
+  - [x] 列出某对象的出边/入边（`goes edges` / `goes view run out|in`）
+  - [x] 按对象类型过滤（`goes view run type <u32>`）
+  - [x] 按 seq 排序（基于 log seq；v1：objects=created_seq，edges=seq）
+
+2.3 Shell 命令升级
+- [x] `goes view list`
+- [x] `goes view run <view>`
+- [x] `goes ls` 等价于默认 View（当前 workspace roots）
+
+
+第 3 阶段：用户管理 / 权限模型（v1 简化版，无认证）
+------------------------------------------------------------------------------
+3.1 AccountObject（真实对象）
+- [x] id / username / flags(admin/normal) / home_workspace(User:<name>) / disabled（v0.1 account record 解析 + whoami 显示）
+- [x] BootManifest 指定 default_user（v1：BootManifest block + UpdateBootManifestRecord 共同决定；shell 启动时从 GOES 解析）
+
+3.2 当前用户上下文
+- [x] ShellContext 持有 current_user（来自 GOES BootManifest/record log；fallback 到 boot_info/superblock；disabled 用户自动降级）
+- [x] whoami 返回真实对象信息（来自 GOES account record；缺省回退为字符串）
+- [x] ws enter：权限检查（Users 只能进自己的；admin 例外）
+
+3.3 权限规则（强制）
+- [x] System：Normal 只读；Recovery + SIP OFF 才可写（GOES writer 强制；shell 提示）
+- [x] Library：admin 可写；normal 只读（GOES writer 强制）
+- [x] Applications：admin install/remove；normal run（写入 Applications 需 admin；run 不写 Applications）
+- [x] Users：只能写 User:<name>（GOES writer 强制；ws enter 也限制）
+
+
+第 4 阶段：应用生命周期（Applications Workspace）
+------------------------------------------------------------------------------
+4.1 App 对象模型（最小）
+- [x] AppManifest（name/version/entry）
+- [x] AppBinary（v1：占位记录，后续接 ELF/Blob 真实写入）
+- [x] AppCapabilities（v1：占位记录）
+- [x] AppWorkspace（v1：创建 `App:<name>` workspace 记录，后续接私有数据写入）
+
+4.2 生命周期命令（Shell）
+- [x] app list（GOES record 重放）
+- [x] app info <name>（GOES record 重放）
+- [x] app install <name> <entry>（v1：内核直接写入 Applications 记录；权限受限）
+- [x] app run <name>（v1：创建 AppDomain stub + 记录 User->App uses 边）
+- [x] app stop <name>（v1：停止并回收 AppDomain stub）
+- [x] app remove <name>（v1：写入 remove record；权限受限）
+
+4.3 应用与用户关系
+- [x] User Workspace 通过 Edge 引用 Application（v1：`app run` 时追加 `uses` 边）
+- [x] run 语义：在 User context 下启动（权限检查）（v1：创建 AppDomain stub；后续接 ELF loader）
+
+
+第 5 阶段：GPU 图形绘制能力（仅底层，不做桌面）
+------------------------------------------------------------------------------
+5.1 GraphicsDevice 抽象
+- [x] info：分辨率/stride/format/后端（ramfb/uefi gop/virtio-gpu 未来）
+- [x] clear(color)
+- [x] draw_rect / draw_line
+- [x] draw_bitmap（1-bit mono，v1 足够）
+
+5.2 Shell debug 命令
+- [x] gfx info
+- [x] gfx test（画色块/线条，能直观看到）
+
+
+工程约束（必须遵守）
+------------------------------------------------------------------------------
+- 不推翻 v0.x：模块边界保持（boot/arch/text|display/panic/drivers/goes/shell/virtio）。
+- 不引入桌面/UI/RN/网络。
+- v1 全同步：不引入 async/多线程。
+- 写操作必须可回放：所有写都进 log；重放能恢复一致视图。
+- 每个阶段都必须有可执行的 shell 验收命令与可复制日志（serial log）。
+
+
+附录 A：Workspace v1 扩展（避免 Workspace 退化为“目录”）
+------------------------------------------------------------------------------
+目标：在 v1 里把 Workspace 定义为“语义空间/权限边界/默认 View Scope”，而不是路径目录树。
+说明：本节已在 v1 中以“最小实现”落地（无递归/无复杂 DSL），用于防止 Workspace 退化为目录树。
+
+A.1 Workspace 类型区分（v1 语义）
+- [x] Workspace 标注为 `writable` 或 `composed`（`ws set <name> <writable|composed>` 写入 spec record）
+- [x] `composed` Workspace 默认只读，不直接写入 object（内核 writer 层拒绝写入）
+
+A.2 Workspace 映射 / 组合语义（只做语义，不做复杂 DSL）
+- [x] 支持一个 Workspace 通过 source 列表“包含”其他 Workspace（sources；`ws set <name> composed <sources...>`）
+- [x] 组合 Workspace 的对象可见性 = sources 的 union（`goes ls`/`goes view run roots` 默认按 union 查询）
+- [x] v1 限制：暂不支持递归 / 循环映射（检测到递归/自引用时跳过并打印 serial 日志）
+
+A.3 Workspace 作为 View Scope 的默认单位
+- [x] `goes view` / shell 查询默认以当前 Workspace 为 scope（composed 时为 sources union）
+- [x] 映射 Workspace 语义等价于固定 View（scope = union(sources)）
+
+A.4 新增 `make` 命令（对象 / Workspace 构造器）
+- [x] `make <name>`：默认推断（有后缀=file，无后缀=workspace）
+- [x] `make file <name>` / `make ws <name>`：显式指定
+- [x] 支持路径形式（v1：仅 `/Users/<u>/<name>`）
+- [x] 若目标已存在，报错并停止
+- [x] `make` 只负责创建，不隐式 `enter` Workspace
+
+A.5 后续命令预留（不要求 v1 实现）【设计已确认，v2+】
+- [ ] `ws list` / `ws enter` / `ws map (include)` 作为后续章节

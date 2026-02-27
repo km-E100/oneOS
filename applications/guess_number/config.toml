@@ -1,0 +1,4 @@
+# v1: plain text config stored in AppConfig (UTF-8).
+min = 1
+max = 100
+

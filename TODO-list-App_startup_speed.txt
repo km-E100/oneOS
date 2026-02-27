@@ -1,0 +1,153 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+oneOS App 冷启动提速专项 TODO
+A / B / C3 / D / E
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+目标
+----
+- 最大化 App 首次 `app run` 性能（cold start），最小化语义损失与安全回退成本。
+- 不引入“路径/目录树”语义；App 必须以 `App:<name>` Workspace 作为包容器。
+- `Applications` Workspace 仅作为 registry（name -> AppWorkspace），不存放包内容。
+- 外来应用仍需校验；系统自带 App 可以走更轻量的信任链（C3）。
+
+当前瓶颈（现象）
+--------------
+- 启动（GOES replay）已提速：不再对 AppBinary 大记录做全量 CRC/全量 payload 读取。
+- 但 App 首次运行仍慢：主要由“读取 ELF 大二进制 + 校验 + 装载 copy/BSS”主导。
+
+验收基线（统一）
+--------------
+- `app run hello` 首次运行耗时显著下降（从分钟级 -> 秒级/十几秒级，取决于二进制大小）。
+- `app run hello` 第二次运行更快（若启用缓存/跳过校验）。
+- 外来 App：首次运行必须执行完整校验（至少 CRC32/ELF 结构校验），失败不 panic，触发 Domain fault 或返回错误。
+- 不改变四大系统 Workspace 冻结语义（System/Users/Applications/Library）。
+
+
+======================================================================
+A. 流式 PT_LOAD 装载（优先级最高）
+======================================================================
+目标：将 “读完整 ELF 到内存 -> 再复制” 改为 “只读 ELF header+phdr -> 按 PT_LOAD 分块读入目标地址”。
+
+A1. 读取路径改造
+- [x] `app run` 读取二进制时，不再一次性读整份 ELF。
+- [x] 仅读取：
+  - ELF header（固定小读）
+  - Program Header Table（按 e_phoff/e_phnum 小读）
+  - 每个 PT_LOAD 的 (offset..offset+filesz) 分块读到 vaddr
+  - BSS zero（memsz - filesz）
+- [x] 继续保留加载窗口约束（APP_LOAD_BASE/APP_LOAD_LIMIT）。
+- [x] aarch64：加载后 icache 同步逻辑仍保留。
+
+A2. I/O 粒度与复用缓冲
+- [x] PT_LOAD 分块读采用 256KiB chunk（与 virtio-blk BULK_BUF 对齐，减少请求次数）。
+- [x] 复用缓冲：virtio-blk `read_at` 改为“多扇区大读”（256KiB BULK_BUF，复用静态缓冲）。
+- [x] 少量大读：virtio-blk 支持一次请求读取多块（避免频繁 512B 请求）。
+
+A3. 可选：边加载边计算 CRC（避免二次遍历）
+- [x] 仅当需要校验时，在 PT_LOAD 分块读取时累积 CRC32（无需二次遍历）。
+- [x] 校验失败：不 panic；返回错误（由上层决定 fault/提示）。
+- [x] 仅清 BSS：段加载不再对 memsz 全清零，仅清 `filesz..memsz`（减少内存写入量）。
+
+验收
+- [x] 首次 `app run hello` 明显提速（I/O 请求数量大幅下降）。
+- [x] 不影响外来 App 校验逻辑（仍可强制校验）。
+
+
+======================================================================
+B. 构建期精简 AppBinary（release + strip/split debug）
+======================================================================
+目标：从源头减少 AppBinary 体积，直接降低读盘与装载成本。
+
+B1. system-shipped apps 构建模式
+- [x] system-shipped apps 默认用 `--release` 构建（opt-level=3）。
+- [x] `panic=abort`（应用侧）。
+- [x] Thin LTO（`applications/` workspace 统一启用 `lto="thin"` + `codegen-units=1`）。
+
+B2. 去除/分离调试信息
+- [x] 不把 DWARF/符号表写入 GOES 的 AppBinary（`-C strip=symbols`, `-C debuginfo=0`）。
+- [ ] 如需调试：split debug 保存到 host（不进 GOES）。
+
+验收
+- [x] GOES 中 AppBinary payload_len 显著下降（release + strip）。
+- [ ] 首次 `app run` 明显提速（与 A 叠加效果更佳）。
+
+
+======================================================================
+C3. system-shipped App 的“安装期预计算校验 + 运行期跳过重算”
+======================================================================
+约束：仅对 system-shipped Apps 生效；外来应用仍必须运行期校验。
+
+目标：避免系统自带 App 首次运行做全量 CRC32（或重复校验），在保持可回滚/可审计前提下最大提速。
+
+C3.1 定义“system-shipped app”标记
+- [x] 在 App:<name> 写入一个由 installer 生成的标记（record `RECORD_APP_SHIPPED_V1`）：
+  - 由 xtask/installer 写入
+  - kernel 不接受普通 AppDomain 伪造（Policy/Capability 限制）
+
+C3.2 写入预计算校验数据（安装期）
+- [ ] （可选，延后）安装器对 system-shipped AppBinary 写入预计算 CRC32（目前仅写入 binary_seq/binary_len）。
+
+C3.3 运行期策略
+- [x] system-shipped：
+  - 若 shipped marker 与当前 binary record (seq+len) 匹配 → 运行期跳过 CRC32 重算，仅做 ELF 结构/范围校验。
+- [x] 外来应用：
+  - 仍走 ELF(AppBinary v2) 路径，并强制运行期 CRC32（第一次运行或 binary 变化时）。
+
+验收
+- [ ] system-shipped App 首次运行不再花时间做 CRC32（对大二进制收益明显）。
+- [ ] 外来应用仍严格校验。
+
+
+======================================================================
+D. 安装期转换为 oneOS 原生“段镜像”格式（长期/工程量大）
+======================================================================
+目标：把 ELF 解析与无用 section 读取成本前移到安装期；运行期只做“按段加载”。
+
+D1. 设计 AppBinary 封装格式（v3+）
+- [x] v1 子集：定义 `RECORD_APP_IMAGE_V1`（payload=56B prefix + `OAPP` 段镜像）。
+  - OAPP header(24): magic="OAPP", ver=1, entry(u64), seg_count(u32)
+  - seg table(N*16): vaddr(u64), filesz(u32), memsz(u32)
+  - data: 按 seg 顺序拼接 PT_LOAD bytes（只含 filesz 部分）
+- [ ] v3+: 扩展 flags/data_offset/per-seg CRC 等（外来应用也可使用）。
+
+D2. 安装器生成段镜像
+- [x] xtask 在 host 侧解析 ELF，输出段镜像（OAPP）payload 写入 App:<name>（仅 system-shipped apps）。
+
+D3. 运行期加载器
+- [x] kernel 运行期支持从 `RECORD_APP_IMAGE_V1` 直接按段镜像加载（system-shipped apps）。
+
+验收
+- [ ] 首次 `app run` 达到“接近最优 I/O”。
+- [ ] 对外来应用可渐进支持（工具链成熟后）。
+
+
+======================================================================
+E. 内存缓存（同次启动二次运行提速）
+======================================================================
+目标：同一次 boot 内重复运行同一 App 几乎瞬时启动。
+
+E1. 缓存粒度选择
+- [x] 选项 1：缓存“段镜像（segment image）”（不缓存整份 ELF，避免首次运行额外整份读盘；默认 8MiB 上限 + LRU）。
+- [ ] 选项 2：缓存已装载段（更快，但需要处理覆盖/清理）。
+
+E2. 缓存键与失效
+- [x] cache key = (app name, arch, binary_record_seq)。
+- [x] 当 binary_record_seq 变化 → 自动 miss（不命中旧缓存）。
+- [x] 设定总缓存上限与 LRU 淘汰。
+
+E3. 安全边界
+- [x] 缓存归属 KernelDomain（内核私有结构，不暴露给 AppDomain）。
+- [x] AppDomain 仍仅通过 `app run` 执行，保持 capability/policy 校验不变。
+
+验收
+- [ ] 同一 boot 内第二次 `app run hello` 明显更快（串口出现 `app: binary cache hit ...`）。
+
+
+======================================================================
+推荐落地顺序（最大收益/最少损失）
+======================================================================
+1) A（流式 PT_LOAD 装载） + A2（大块读+复用缓冲）
+2) B（release + strip/split-debug）
+3) C3（仅 system-shipped 的预计算校验）
+4) E（内存缓存，提升重复运行体验）
+5) D（段镜像格式，作为长期演进）

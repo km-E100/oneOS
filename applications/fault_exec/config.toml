@@ -1,0 +1,2 @@
+# fault_exec: attempts to execute from stack memory to validate NX enforcement.
+

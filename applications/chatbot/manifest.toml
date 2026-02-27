@@ -1,0 +1,13 @@
+name = "chatbot"
+version = "0.1"
+
+# The entry indicates the binary interface expected by oneOS.  For
+# a Rust application using the `oneos_app` crate this should remain
+# `elf:v1` so that the loader can locate the `oneos_app_main`
+# symbol.
+entry = "elf:v1"
+
+# caps_mask determines which system capabilities are exposed to the
+# application.  We only need access to the console (bit 0x1) and
+# the watchdog (bit 0x1), so keep the mask conservative.
+caps_mask = "0x1"

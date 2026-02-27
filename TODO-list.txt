@@ -1,0 +1,280 @@
+oneOS App & Sandbox TODO List
+（App 执行模型 + Sandbox 安全机制专项规划）
+======================================================================
+
+定位说明
+----------------------------------------------------------------------
+- 本 TODO 专注于 oneOS 的 App 执行体系与 Sandbox 安全模型。
+- 不涉及 RN / GUI / 网络 / 多线程 / 异步。
+- 架构前提：全内核态 + Sandbox Domain；无传统 user/kernel 切换。
+- Workspace 是语义空间与权限边界，不是路径或目录。
+- 系统级 Workspace 冻结：System / Users / Applications / Library（不可变）。
+
+目标验收（最终状态）
+----------------------------------------------------------------------
+1) hello 与 GuessNumber：
+   - 不存在于 kernel builtin
+   - 源码位于项目根目录 applications/
+   - 构建后存在为 App:<name> Workspace
+   - 通过 Applications Workspace registry 注册
+   - 只能通过 `app run <name>` 启动
+
+2) App 运行：
+   - 在 AppDomain 中运行
+   - 只能通过 AppApi 使用系统能力
+   - 崩溃/越权 → Domain fault，不触发 kernel panic
+
+3) Sandbox：
+   - 所有资源访问走 capability + policy
+   - AppDomain 默认最小权限
+   - 违规访问可复现、可审计、可恢复
+
+======================================================================
+
+
+第 1 阶段：App 工程形态（Repo 级）
+----------------------------------------------------------------------
+目标：在源码层明确“App ≠ kernel”。
+
+1.1 applications/ 目录建立
+- [x] 在仓库根目录新增 applications/
+- [x] 禁止 kernel 直接依赖 applications 中的 crate（applications 是独立 workspace，不加入根 workspace）
+- [x] applications 中的代码不得引用 kernel crate（改用 applications/sdk/oneos-app 提供 AppApi）
+
+1.2 每个 App 为独立 Rust crate
+- [x] hello 迁移为 applications/hello
+- [x] GuessNumber 迁移为 applications/guess_number
+- [x] 每个 App 拥有独立 Cargo.toml / src/main.rs
+
+1.3 App 编译约束
+- [x] no_std（允许 core / alloc）
+- [x] 禁止直接访问硬件、驱动、全局状态（仅通过 AppApi）
+- [x] 只能通过 AppApi 与系统交互（applications/sdk/oneos-app::AppApiV1）
+
+验收：
+- kernel 不再包含 hello / GuessNumber 代码
+- `cargo build` 不因迁移破坏 kernel 构建
+
+
+======================================================================
+
+
+第 2 阶段：App ABI（App 与系统的最小契约）
+----------------------------------------------------------------------
+目标：明确 App 能“做什么、不能做什么”。
+
+2.1 定义 App 入口 ABI（v1）
+- [x] 统一入口符号：
+  `#[no_mangle] extern "C" fn oneos_app_main(api: *const AppApi) -> i32`
+
+2.2 AppApi v1（最小能力集）
+- [x] console_write(ptr, len) -> isize
+- [x] console_read(ptr, len) -> isize（可选）
+- [x] 所有函数均为函数指针表
+- [x] 内核在调用时执行 capability + policy 校验
+
+2.3 ABI 稳定性规则
+- [x] AppApi 版本号固定（v1）
+- [x] 不允许 App 假设内核内部结构
+- [x] ABI 变更只能新增，不破坏旧接口
+
+验收：
+- hello App 可通过 AppApi 输出文本
+- 无 App 可绕过 AppApi 调用内核函数
+
+
+======================================================================
+
+
+第 3 阶段：App Manifest / Config / Workspace 模型
+----------------------------------------------------------------------
+目标：App 是一个“包”，不是一条记录。
+
+3.1 AppManifest（Workspace 内对象）
+- [x] name / version / entry / caps
+- [x] 存储于 App:<name> Workspace
+- [x] 不允许存于 Applications Workspace（Applications 仅 registry）
+
+3.2 AppConfig（可选）
+- [x] 默认配置只读（App:<name> 仅 admin 可写；AppDomain 无写权限）
+- [x] 用户覆盖配置写入 Users Workspace（User:<name>；内核优先读取 user override）
+
+3.3 AppBinary（ELF / Blob）
+- [x] 二进制 bytes 存于 App:<name>
+- [x] Applications 仅保存 registry（name → App:<name>）
+
+验收：
+- `app info <name>` 从 AppWorkspace 读取信息
+- Applications Workspace 不包含 AppBinary
+
+
+======================================================================
+
+
+第 4 阶段：xtask 打包链路（Build → GOES）
+----------------------------------------------------------------------
+目标：App 构建与系统安装解耦。
+
+4.1 xtask 扫描 applications/
+- [x] 扫描 applications/*/manifest.toml
+- [x] 为每个 App 编译对应架构 ELF（no_std，双架构）
+
+4.2 AppBinary 写入 GOES
+- [x] 写入 App:<name> Workspace：
+  - AppManifest
+  - AppBinary
+  - AppCapabilities
+- [x] 在 Applications Workspace 写 registry record（name → App:<name>）
+
+4.3 写入规则
+- [x] 正常 install：不写 System（仅写 Applications/App:<name>/User:<name> 等允许区域）
+- [x] install 需 admin capability（由 host installer 受控；kernel 写路径仍执行权限校验）
+- [x] 所有写入为 append-only record
+
+验收：
+- goes ls Applications 能列出已安装 App
+- AppWorkspace 可通过 view 查询到对象
+
+
+======================================================================
+
+
+第 5 阶段：app run（加载但不执行，v1）
+----------------------------------------------------------------------
+目标：验证 AppBinary 与 Sandbox 边界。
+
+5.1 app run v1 行为
+- [x] 从 Applications 查 name → App:<name>
+- [x] 从 AppWorkspace 读取 AppBinary（按当前架构选择）
+- [x] 校验 ELF 头（arch / endian / class）
+- [x] 解析 program headers
+- [x] 打印 entry / segments 信息（console + serial）
+- [x] 不跳转执行
+
+5.2 错误处理
+- [x] ELF 非法 → 返回错误
+- [x] Workspace 不存在 → 返回错误
+- [x] 不 panic
+
+5.3 启动/运行性能（已合入）
+- [x] GOES replay 对 `RECORD_APP_BINARY_V1/V2` 启动时跳过全量 CRC/全量载荷读取（仅读取 48B prefix 建索引）
+- [x] `app run` 通过 replay 索引的 AppBinary locator 读取二进制（不再扫描全局 record log）
+- [x] 增加 `RECORD_APP_VERIFY_CACHE_V1`（写入 `User:<name>`），实现“首次/变更后”才做二进制 CRC32（后续运行跳过）
+
+备注（实现修正，已合入）
+- [x] 修复 `WorkspaceKind::User` scope 语义：存 owner（"admin"）而非 "User:admin"，避免 GOES 过滤阶段误判无权限
+- [x] `can_goes_read_quiet()` 真正 quiet：GOES replay 过滤不再刷 denied 日志（只在显式命令时记录）
+
+验收：
+- `app run hello` 输出 ELF 校验信息
+- 系统不因 AppBinary 错误崩溃
+
+
+======================================================================
+
+
+第 6 阶段：AppDomain 执行模型（v2）
+----------------------------------------------------------------------
+目标：真正让 App 在 Sandbox 中运行。
+
+6.1 AppDomain 创建
+- [x] app run 创建 AppDomain
+- [ ] Domain 绑定：
+  - [x] owner = current user
+  - [x] workspace scope = App:<name> (RO) + LAD:<name> (RW)
+  - [x] caps = AppCapabilities（并强制注入 GOES_READ(App) + GOES_READ/WRITE(LAD)）
+
+6.2 内存与执行
+- [ ] 为 AppDomain 分配独立内存区域（v2：先共地址空间，后续再做 page-table/region set）
+- [x] 加载 ELF LOAD 段（PT_LOAD copy + BSS zero）
+- [x] 构造栈与 AppApi（per-run stack + AppApiV1 指针）
+- [x] 跳转 oneos_app_main（通过 linker script 固定 ENTRY=oneos_app_main）
+
+6.3 生命周期
+- [x] app stop → kill domain
+- [ ] domain 崩溃 → fault，不 panic（需要异常/保护机制；当前阶段主要保证越权不 panic）
+
+验收：
+- [x] hello / GuessNumber 可真实运行
+- App 崩溃不影响 shell / kernel
+
+
+======================================================================
+
+
+第 7 阶段：Sandbox 安全机制（核心）
+----------------------------------------------------------------------
+目标：确保 App “不能越界”。
+
+7.1 Capability 强制
+- [x] AppDomain 默认无 GOES_WRITE(System)
+- [x] AppDomain 无 Library 全局写权限（仅允许写入 LAD:<app> 私有域）
+- [x] Users Workspace scope 仅限当前用户
+
+7.2 Policy 校验点
+- [x] 所有 AppApi 调用必须校验：
+  - Domain 身份
+  - Capability 类型
+  - Workspace scope
+- [x] 失败返回错误或触发 Domain fault
+
+7.3 Fault vs Panic
+- [x] AppDomain 违规 → Domain fault
+- [x] Kernel panic 仅用于不可恢复错误
+- [x] App fault 不计入 boot failures
+
+7.4 App + Sandbox 数据模型硬化（本轮新增）
+- [x] App 只读包语义完成（AppDomain 禁止写 App:<name>）
+- [x] App 私有数据区完成（Library/AppData/<app> 以 workspace=`LAD:<app>` 表达）
+- [x] App 写越权 → Domain fault（拒绝 + fault，不 panic）
+
+验收：
+- App 访问 System 被拒绝
+- App 越权触发 fault（可复现）
+
+
+======================================================================
+
+
+第 8 阶段：审计与恢复
+----------------------------------------------------------------------
+目标：所有行为可追踪、可回滚。
+
+8.0 收敛（补齐所有未完成项）
+- [ ] 补齐第6阶段未完成项：
+  - [x] Domain owner 绑定为 current user（可审计）
+  - [x] AppDomain 独立内存区域/region set（v2 起步版；v3 再上页表隔离）
+  - [ ] App panic/崩溃 → fault（可回收 Domain，不影响 shell）
+- [ ] 补齐本阶段与后续阶段所有未勾选条目，直至 TODO 清零
+
+8.1 审计记录
+- [x] app install/remove/run/stop
+- [x] capability 发放与回收
+- [x] App fault / kill
+
+8.2 Recovery 兼容
+- [x] App 行为不影响 System 启动
+- [x] AppBinary 损坏不阻止系统进入 shell
+
+验收：
+- 审计记录可通过 GOES 重放
+- Recovery 不因 App 状态失败
+
+
+======================================================================
+
+附录：后续阶段规划（不在当前阶段实现）
+----------------------------------------------------------------------
+- [ ] 页表级隔离（MMU-backed AddressSpace）：v3+，非当前阶段实现
+
+
+======================================================================
+
+
+完成判定（最终）
+----------------------------------------------------------------------
+- kernel 不包含示例 App
+- App = Workspace + Domain + Capability
+- Applications = registry
+- Sandbox 行为明确、可验证、不可绕过
+- hello / GuessNumber 成为真正的 oneOS App

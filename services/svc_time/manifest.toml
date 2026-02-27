@@ -1,0 +1,5 @@
+name = "svc_time"
+version = "0.1"
+entry = "builtin:v1"
+caps_mask = "0x0"
+

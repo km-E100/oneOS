@@ -1,0 +1,1 @@
+/Users/zhangjunyi/Desktop/编程/Operating\ System/oneOS/oneOS/applications/target/x86_64-unknown-none/release/fault_exec: /Users/zhangjunyi/Desktop/编程/Operating\ System/oneOS/oneOS/applications/fault_exec/src/main.rs /Users/zhangjunyi/Desktop/编程/Operating\ System/oneOS/oneOS/applications/sdk/oneos-app/src/lib.rs

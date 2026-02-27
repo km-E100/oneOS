@@ -1,0 +1,39 @@
+[package]
+name = "oneos-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "oneos-x86_64"
+path = "src/bin/x86_64.rs"
+
+[[bin]]
+name = "oneos-aarch64"
+path = "src/bin/aarch64.rs"
+
+[[bin]]
+name = "oneos-raw-aarch64"
+path = "src/bin/raw_aarch64.rs"
+
+[[bin]]
+name = "oneos-raw-x86_64"
+path = "src/bin/raw_x86_64.rs"
+
+[dependencies]
+spin = { workspace = true }
+oneos-boot-proto = { workspace = true }
+
+[target.'cfg(target_os = "none")'.dependencies]
+oneos-service = { path = "../services/sdk/oneos-service" }
+oneconsole = { path = "../services/oneconsole", features = ["kernel-builtin"] }
+goesd = { path = "../services/goesd", features = ["kernel-builtin"] }
+svc_logger = { path = "../services/svc_logger", features = ["kernel-builtin"] }
+svc_time = { path = "../services/svc_time", features = ["kernel-builtin"] }
+svc_notify = { path = "../services/svc_notify", features = ["kernel-builtin"] }
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { workspace = true }

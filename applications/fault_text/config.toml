@@ -1,0 +1,2 @@
+# fault_text: attempts to write into its own .text section to validate W^X enforcement.
+

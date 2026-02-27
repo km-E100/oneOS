@@ -1,0 +1,425 @@
+oneOS Post-MMU TODO List（页表完成后的全链路TODO：多任务→服务化→驱动→.onepkg→UI→收尾）
+================================================================================
+
+前提（已完成/默认存在）
+--------------------------------------------------------------------------------
+- MMU-backed AddressSpace 已具备：内核页表稳定、可切换/可禁用开关、基础异常/页故障可观测、最小 address space 抽象可用。
+- 仍坚持：全内核态运行，不引入传统“用户态/内核态”特权级语义；隔离靠 Domain + Capability + Policy + AddressSpace（页表只是隔离手段之一）。
+- 四大系统级 Workspace 冻结：System / Users / Applications / Library 不可变。
+- App 包语义：App:<name>（只读包）+ LAD:<name>（可写私有数据区，逻辑属于 Library/AppData/<app>，但不引入路径树）。
+- 本TODO不提 onehub；服务只做到“示例可跑 + 多文件模块化 + 能展示服务化价值”。
+
+全局验收目标（最终你要看到的系统样子）
+--------------------------------------------------------------------------------
+- Default 模式：OneBoard（UI服务）自启动；UI挂了自动回落到增强 shell（仍有完整服务/驱动）。
+- App：支持安装/卸载/更新（.onepkg）、签名/校验、依赖 assets、多文件工程、权限声明、最小API稳定。
+- Service：能以 ServiceDomain 运行，具备更高cap但受policy约束；至少跑通：UI服务 + GOES服务化示例 + GPU/输入/块设备驱动服务化示例（不要求全套硬件完美）。
+- 安全：越权=domain fault；审计可回放；Recovery/SIP链路清晰；更新/回滚机制可用。
+- 核心收尾：文档齐、接口稳定、回归测试最小集、性能基线、发布流程可重复。
+
+================================================================================
+Stage 1：开启“真正的页表隔离”验收闭环（MMU之后必须先稳）
+--------------------------------------------------------------------------------
+目标：打开地址空间切换后，App/Service 都能来回切换运行并稳定回到 shell，不靠“默认禁用”。
+
+1.1 地址空间策略定稿（二选一，但要写进文档+代码注释）
+- [ ] A 路线：全地址空间切换（App PT 包含 kernel 映射）
+  - kernel 映射固定在高半区（或固定范围），App PT 复制同一套 kernel 映射
+- [x] B 路线：TTBR1 固定内核 + TTBR0 专注 App（aarch64更自然）
+  - 内核全程不切 TTBR1，只切 TTBR0；App只能影响 TTBR0
+- [x] x86_64 对应路线：CR3切换；内核映射固定区域；App PT 也包含内核映射或采用共享顶层表
+  - 备注：当前实现处于“v2 过渡态”，仍使用“App PT 含 kernel 映射 + CR3切换”的可运行方案；
+    真正的“共享顶层/固定内核映射”的收敛在 Stage 1.x/Stage 2 过程中逐步完成（不引入用户态）。
+
+1.2 AddressSpace 生命周期（必须可审计、可回收）
+- [x] create_address_space(kind=App|Service, base_layout=…) -> Asid/Root（v2：App 已可创建并持有 ASID）
+- [x] map/unmap/perm-change 的统一入口（走 policy）
+- [x] destroy_address_space：回收页表页、刷新TLB、回收物理页（v2：回收页表页已接入 stop/kill domain）
+
+1.3 页表映射最小集合（先小后大，先能跑）
+- [x] Kernel 映射：text/rodata/data/bss/heap/stack/MMIO（只在 kernel space）
+- [x] App 映射：AppCode/AppRO/AppRW/AppStack + AppApi共享页（如需要）
+- [x] AppStack 必须页对齐分配（避免首次 app run 因非页对齐映射导致 `MmuBuildFailed`）
+- [x] Framebuffer 映射策略：默认不给 App；只给 OneBoard/GPU service（cap控制）
+- [x] GOES 块设备：默认不给 App；只给 goesd/service（cap控制）
+
+1.4 TLB/屏障与ASID（稳定性核心）
+- [x] aarch64：TLBI按ASID/VMID策略；必要屏障（DSB/ISB）统一封装
+- [x] x86_64：invlpg / 全刷策略；必要的序列化指令封装
+- [x] 统一接口：addrspace::enter(as) / leave()（v2：入口已收敛；后续继续把寄存器写入集中到 mmu 层）
+
+1.5 Page Fault 语义（必须明确 fault vs panic）
+- [x] 取 fault 信息：地址/权限/来源指令（尽可能）
+  - aarch64: sync trap 记录 esr/elr/far/domain
+  - x86_64: #PF/#GP/#UD ISR 记录 domain+rip+cr2/err，并写入 pending fault（延迟处置）
+- [x] 若 fault 在 App/Service domain：Domain fault（kill/restart/quarantine）+ audit
+  - 关键：ISR/异常入口只“记录 pending + 跳转 abort trampoline”，禁止在 ISR 内做 stop_domain/写盘/分配，避免 triple fault 重启
+- [x] 若 fault 在 KernelDomain：kernel panic（记录+bootfail计数策略）
+- [x] 支持最小 “打印一行可定位” 格式：domain + rip/pc + addr + reason
+
+1.6 开关策略（开发期允许，发布期收敛）
+- [x] bootflag：mmu_strict=on/off（开发用）
+- [x] 默认：开启隔离；遇到严重bug可临时关闭用于调试（但要在屏幕/日志显式提示）
+
+Stage 1 验收
+- [x] app run hello / guess_number 在 strict=on 下可运行且回到 shell
+- [x] App 越界指针/非法访问触发 domain fault，不死机
+- [x] Service（一个最小示例）也能在 strict=on 下运行并回到 shell
+
+
+================================================================================
+Stage 2：多任务与抢占式调度（让系统从“能跑”到“能活”）
+--------------------------------------------------------------------------------
+目标：从单任务/串行提升到多Domain并存、抢占、基本公平；为服务化/驱动化做地基。
+
+2.1 任务模型（线程/进程/协程先定清）
+- [x] v2最小：每个 Domain 至少一个 main thread（内核线程实现）
+- [x] 支持：kernel threads（系统内部任务）
+- [x] 支持：domain threads（同一domain内未来扩展，先预留API）
+
+2.2 Scheduler 核心
+- [x] tick 驱动抢占（100Hz已存在：扩展为真正抢占）
+- [x] runqueue：按优先级/时间片（先简单：RR + 两级优先）
+- [x] 上下文切换：保存/恢复寄存器、切 address space、切 domain current
+- [x] 时间片到期：强制切换到下一个可运行任务
+- [x] sleep/wakeup：基于 tick 的最小定时器队列
+
+2.3 同步原语（先为内核/服务够用）
+- [x] SpinLock 已有则补全：可中断安全版本 / 可睡眠版本（如果有阻塞）
+- [x] Mutex（阻塞）/ CondVar（条件变量）/ Semaphore（信号量）
+- [x] WaitQueue：支持 driver/service 等待事件（键盘、块设备、IPC）
+
+2.4 Domain 生命周期与调度接入
+- [x] domain start：创建 thread + address space + 初始cap + 加入 runqueue
+- [x] domain stop/kill：从 runqueue 移除、回收 thread、回收 address space
+- [x] watchdog/timeout：每个 domain 可设置 CPU 时间/墙钟时间超限→fault
+
+2.5 中断与驱动事件（最小事件分发）
+- [x] 中断处理分两段：top-half（快）+ bottom-half（可调度）
+- [x] bottom-half 以 kernel thread 或 service 通知方式跑（为驱动服务化做铺垫）
+
+Stage 2 验收
+- [x] shell 作为一个 domain/task 可持续交互
+- [x] 同时跑：OneBoard(占位服务) + shell + 一个 app，不互相卡死
+- [x] watchdog/timeout 能杀死死循环 app 并返回 shell
+
+
+================================================================================
+Stage 3：IPC 与 Capability/Policy 在“可调度系统”里落地
+--------------------------------------------------------------------------------
+目标：服务化的关键：驱动/GOES/UI 全靠 IPC；IPC 必须天然走 cap/policy。
+
+3.1 IPC 机制选型（v2最小）
+- [x] Mailbox（消息队列）+ SharedPage（可选）双轨：
+  - 控制消息走 mailbox
+  - 大数据（图像/块）走共享页或 ring buffer（cap授权）
+- [x] 消息格式：固定头 + payload；包含：src_domain、dst_service、opcode、len
+
+3.2 IPC 原语
+- [x] ipc_send(to, msg) / ipc_recv(blocking/nonblocking)
+- [x] 超时 recv（避免服务永远等）
+- [x] backpressure：队列满 → 返回错误或阻塞（策略要定）
+- [x] 权限：发送/接收必须持有 capability（IPC_SEND/IPC_RECV 或按service粒度）
+
+3.3 Service Registry（轻量、非onehub）
+- [x] 系统启动时：Kernel 注册内建服务名→domain id（例如 "oneboard", "goesd", "gpusvc"）
+- [x] shell 命令：service list / service info / service ping
+- [x] app/service 通过名字发现服务（内部映射，不是路径）
+
+3.4 Policy 扩展（围绕服务化）
+- [x] 资源类型：FB_MAP, GPU_SUBMIT, BLK_READ/WRITE, INPUT_READ, GOES_READ/WRITE
+- [x] policy 失败：返回错误或 domain fault（可配置）
+- [x] 审计：IPC 关键操作（启动/停止/越权）写 audit event
+
+Stage 3 验收
+- [x] shell -> IPC ping goesd/oneboard OK
+- [x] app 不能直接访问 framebuffer，但可通过 oneboard 请求“打印文本/通知”
+
+
+================================================================================
+Stage 4：Service 框架落地（先让“服务能写、能跑、能多文件”）
+--------------------------------------------------------------------------------
+目标：给你朋友一个“写服务像写程序”的开发面；先示例，不追求全生态。
+
+4.1 Service 工程形态（仓库结构）
+- [x] 新建 /services 目录（与 /applications 平级）
+- [x] 每个 service 一个独立 crate，可多文件模块（mod.rs + 多文件）
+- [x] 统一 Service ABI（类似 AppApi，但更强一点）
+  - service_main(api: *const ServiceApi) -> i32
+  - ServiceApi：ipc_send/recv、log、timer、(可选) map_shared_page、cap_query
+
+4.2 ServiceDomain 运行模型
+- [x] service start <name>：创建 ServiceDomain + address space + caps + 入口执行
+- [x] service stop/restart：可控回收
+- [x] crash/fault：按 FaultPolicy 自动重启（可配置次数）
+
+4.3 示例服务（必须做，且多文件）
+- [x] svc_logger：集中日志服务（收集来自app/service的log消息，输出到console）
+- [x] svc_time：时间/uptime查询服务（供 app/oneboard 用）
+- [x] svc_notify：通知服务（演示 IPC + UI 或 shell 输出）
+
+4.4 服务打包进 GOES（先不用.onepkg）
+- [x] xtask 在 install 时把 services/<name>/ 也打包成 Service:<name> workspace（或 App:形式复用，但建议 Service:<name>）
+- [x] shell 支持：service list / service run <name>（或自动启动列表）
+
+Stage 4 验收
+- [x] 系统启动自动拉起 svc_logger + svc_time
+- [x] app 通过 IPC 调用 svc_time 获取时间并输出
+- [x] 服务工程至少包含 3 个源文件（多文件模块化跑通）
+
+
+================================================================================
+Stage 5：驱动服务化（SystemDrivers as Services：先做“示例驱动服务”）
+--------------------------------------------------------------------------------
+目标：驱动不再塞进 kernel；kernel 只保留最小“硬件枚举+中断转发”。
+
+5.1 内核最小驱动层收缩
+- [ ] 内核仅保留：
+  - 基础 PCI/virtio 枚举（只枚举，不管理队列细节）
+  - 中断接收与转发（投递到对应 driver service）
+  - MMIO 映射管理（按cap/policy给服务映射）
+- [ ] 将 virtio-blk/keyboard 的“业务逻辑”逐步搬到服务
+
+5.2 Driver Service API（比普通 service 多一点）
+- [ ] request_mmio_map(device_id, bars, perms)
+- [ ] wait_irq(device_id) / ack_irq
+- [ ] dma/buffer 注册（如果需要）：register_shared_buffer(size)->handle
+
+5.3 示例驱动服务（不追求全套）
+- [ ] drv_input：virtio-keyboard driver service
+  - 将 key events 发送给 OneBoard 或 shell
+- [ ] drv_blk：virtio-blk driver service
+  - 对 goesd 提供块读写 RPC
+- [ ] drv_gpu（可选先占位）：先不做3D，只做“framebuffer blit”或“2D填充”接口
+  - OneBoard 可向 drv_gpu 请求绘制
+
+Stage 5 验收
+- [ ] 内核不再直接处理键盘队列细节（只转发中断/映射）
+- [ ] shell 输入来自 drv_input（通过 IPC）
+- [ ] goesd 通过 drv_blk 读写块设备（内核不直接写GOES设备）
+
+
+================================================================================
+Stage 6：GOES 服务化示例（不追求完全剥离，但要“可用”）
+--------------------------------------------------------------------------------
+目标：把“文件/对象系统”做成服务，使 App/Service 都通过 IPC 访问；内核只保留最小可信入口。
+
+6.1 goesd（GOES daemon/service）职责划分
+- [ ] 内核保留：superblock/checkpoint 的最低限读取（仅为 boot 必需）
+- [ ] goesd 接管：
+  - 记录追加（writer）
+  - replay/index 构建（可在后台做）
+  - workspace/object/edge/view 的读写接口
+- [ ] App/Service 访问 GOES：
+  - RPC：goes_read/workspace_ls/object_read/append_record 等
+  - 权限：cap=GOES_READ/WRITE + workspace scope policy
+
+6.2 一致性与恢复
+- [ ] goesd 崩溃后自动重启：index 可重建
+- [ ] 若日志局部损坏：按照你已有 recovery 兼容策略继续进 shell
+
+Stage 6 验收
+- [ ] shell 的 goes 子命令走 goesd IPC（而不是直接内核调用）
+- [ ] app run/install 仍可工作（对goes的写经 goesd）
+
+
+================================================================================
+Stage 7：.onepkg（安装包格式）+ 系统端支持（不提onehub）
+--------------------------------------------------------------------------------
+目标：你提出的.onepkg = “Workspace压缩 + 配置 + 签名/校验”落地，并且能安装/更新/卸载。
+
+7.1 .onepkg 格式（v1 规范，写进文档）
+- [ ] 包头：magic="ONEPKG1" + version + flags + manifest_len + payload_len
+- [ ] manifest（文本/JSON/TOML任选，但要固定规范）包含：
+  - name, version, kind=app|service
+  - entry（elf/builtin）、required_caps、assets列表、hash列表
+  - target_arch（aarch64 / x86_64 可选）
+- [ ] payload：一个或多个 workspace snapshot（App:<name> + LAD:<name> 可选）
+  - App workspace：manifest/config/binary/assets
+  - LAD workspace：默认空（安装时创建），包里可选包含迁移脚本/初始数据
+- [ ] signature：
+  - v1 最小：CRC32/sha256 校验
+  - v1.1：Ed25519 签名（推荐尽早上）
+- [ ] 压缩：zstd（优先）或 deflate（简单）
+
+7.2 系统端安装流程（shell命令 + goesd）
+- [ ] onepkg verify <file>：校验+签名检查
+- [ ] app install <file.onepkg>：
+  - verify
+  - 写 Applications registry
+  - 写 App:<name> workspace 内容（只读包）
+  - 创建/保留 LAD:<name>（可写数据区）
+- [ ] app remove <name>：
+  - 删除 registry
+  - 删除 App:<name>
+  - LAD:<name> 默认保留或询问（策略：默认保留数据，提供 --purge）
+- [ ] app update <file.onepkg>：
+  - 原子更新：App:<name>.New → 切换 → App:<name>.Old 回收
+  - LAD 保持不动（或支持数据迁移脚本）
+
+7.3 Recovery/SIP 配合
+- [ ] Normal 模式：禁止写 System
+- [ ] onepkg 只影响 Applications/App/LAD（不触 System）
+- [ ] 若包损坏导致 app 无法启动：自动回滚 App workspace（不影响系统启动）
+
+Stage 7 验收
+- [ ] 能打包 hello 为 onepkg，并在系统内安装运行
+- [ ] update 能替换 app binary/asset，LAD 数据不丢
+- [ ] remove --purge 能清理 LAD
+
+
+================================================================================
+Stage 8：开发者工具（Windows/macOS 双端 Rust 编译打包器：oneOS Applications Developer）
+--------------------------------------------------------------------------------
+目标：给开发者“一条命令编译+打包onepkg”，不要求商店，不要求联网。
+
+8.1 工具形态（本地 CLI）
+- [ ] oneos-app-dev init（生成模板：app/service 多文件、assets、manifest）
+- [ ] oneos-app-dev build --arch aarch64（编译no_std目标产物）
+- [ ] oneos-app-dev pack -> <name>-<ver>.onepkg
+- [ ] oneos-app-dev sign（可选：读取私钥签名）
+- [ ] oneos-app-dev verify（本地验证包）
+
+8.2 工具链最小要求
+- [ ] 支持 workspace 内多文件Rust项目（模块拆分不影响）
+- [ ] assets 自动收集（目录递归/白名单）
+- [ ] 产物布局与系统端一致（App:<name> + assets + config）
+
+8.3 与 xtask 的关系
+- [ ] xtask 继续负责“构建镜像/内建打包”
+- [ ] oneos-app-dev 负责“外部开发者打包成onepkg”
+- [ ] 两者共享同一份 onepkg spec（同一个crate复用解析/生成）
+
+Stage 8 验收
+- [ ] macOS 上生成 onepkg，拷进镜像/挂载后安装运行
+- [ ] Windows 端也能生成同规格onepkg（不要求直接跑QEMU）
+
+
+================================================================================
+Stage 9：图形与 OneBoard（UI服务化：Default模式的脸）
+--------------------------------------------------------------------------------
+目标：OneBoard 是服务，挂了回落 shell；图形API命名与最小接口稳定。
+
+9.1 OneBoard 启动与回落策略
+- [ ] boot：启动服务列表中包含 oneboard
+- [ ] 若 oneboard 未启动/崩溃：
+  - 自动回落 Enhanced Shell UI（纯文本但完整功能）
+  - shell 提示“UI unavailable, fallback enabled”
+- [ ] oneboard 可重启，不影响系统其余部分
+
+9.2 OneGfx（图形API）最小规范（先2D）
+- [ ] onegfx_begin_frame / end_frame
+- [ ] fill_rect / blit_bitmap / draw_text（文字可先用系统字体）
+- [ ] buffer 提交：通过 drv_gpu 或 framebuffer service
+- [ ] 权限：GPU_DRAW/FB_MAP 仅授予 OneBoard 与特定服务
+
+9.3 输入与事件
+- [ ] drv_input -> oneboard：键盘事件
+- [ ] oneboard 内部事件循环：最小窗口/面板机制（先不做复杂窗口管理）
+- [ ] oneboard 提供最小“App launcher”面板（列出已安装App）
+
+Stage 9 验收
+- [ ] OneBoard 能显示桌面/面板并启动一个 App
+- [ ] OneBoard 崩溃后系统不死，自动回到 shell
+- [ ] onegfx API 在内核/服务侧稳定可用
+
+
+================================================================================
+Stage 10：系统更新与恢复（系统级收尾关键，不碰onehub）
+--------------------------------------------------------------------------------
+目标：你之前描述的“System.New/System.Old + 自检 + 回滚”落地到可用版本。
+
+10.1 System 更新包（单独于onepkg）
+- [ ] system update 包：包含 System workspace snapshot + 签名
+- [ ] 更新流程：
+  - 下载/导入（先手动导入也行）
+  - reboot -> 自动Recovery子流程
+  - verify -> 写 System.New -> 切换 -> reboot -> selfcheck
+  - selfcheck 通过：删除 System.Old
+  - selfcheck 失败：回滚 System.Old
+
+10.2 自检（selfcheck）最小集
+- [ ] 能启动 shell
+- [ ] goesd 可起
+- [ ] drv_input 可起
+- [ ] （可选）oneboard 可起
+- [ ] 关键检查失败=自动回滚（不需要用户操作）
+
+10.3 引导与审计
+- [ ] bootstate 失败计数更新逻辑清晰
+- [ ] 每次回滚写审计事件（供诊断）
+
+Stage 10 验收
+- [ ] 手动制造一个坏 System.New，能自动回滚
+- [ ] 好更新能完成并清理 Old
+
+
+================================================================================
+Stage 11：安全加固（Sandbox/Policy/Audit 彻底收尾）
+--------------------------------------------------------------------------------
+目标：把“能跑”变成“能防”，并且规则稳定。
+
+11.1 权限边界复查（全表）
+- [ ] App 只能：读 App:<name>，写 LAD:<name>，其余需cap且默认拒绝
+- [ ] Service：按角色授cap，禁止“默认全权”
+- [ ] Kernel：只有在 Recovery+SIP=OFF 才能写 System（且要cap）
+- [ ] Users：跨用户访问默认拒绝（policy+fault）
+
+11.2 FaultPolicy 完整语义
+- [ ] kill / restart / quarantine 三种策略都可用
+- [ ] quarantine 的表现：domain不可重启，需admin命令解除
+
+11.3 审计事件完善
+- [ ] app install/remove/update/run/stop
+- [ ] service start/stop/restart
+- [ ] policy deny / domain fault
+- [ ] system update / rollback
+- [ ] 关键cap发放/回收
+
+Stage 11 验收
+- [ ] 越权写稳定触发 fault + audit
+- [ ] audit 可回放并在 shell 显示最近事件摘要
+
+
+================================================================================
+Stage 12：核心收尾（接口冻结、文档、测试、性能、发布）
+--------------------------------------------------------------------------------
+目标：把系统做成“别人能接手写应用/服务”的状态。
+
+12.1 API/ABI 冻结
+- [ ] AppApi v1 冻结（console、ipc、time、(可选) goes rpc wrapper）
+- [ ] ServiceApi v1 冻结（ipc、timer、device map、log）
+- [ ] onepkg spec v1 冻结（字段、hash算法、签名算法）
+
+12.2 文档（必须写，不然你未来会忘）
+- [ ] oneOS 架构总览：Workspace/Domain/Cap/Policy/MMU
+- [ ] App 开发指南：多文件结构、assets、config、打包、权限
+- [ ] Service 开发指南：IPC、cap、设备映射、示例
+- [ ] onepkg 规范：二进制格式、manifest字段、签名
+- [ ] Recovery/SIP/Update 规范：流程图
+
+12.3 回归测试最小集（自动跑）
+- [ ] 启动进入 shell
+- [ ] app run hello/guess_number
+- [ ] 安装/更新/卸载 onepkg
+- [ ] OneBoard 启动/崩溃回落
+- [ ] IPC ping/time 服务
+- [ ] domain fault 触发与审计记录
+
+12.4 性能基线
+- [ ] 启动时间（bootloader->shell, bootloader->oneboard）
+- [ ] app 启动耗时
+- [ ] IPC 往返延迟
+- [ ] 页表切换开销（aarch64/x86_64）
+- [ ] 关键路径 profile（至少能打印统计）
+
+12.5 发布与镜像构建
+- [ ] xtask 一键：build -> install -> pack images（esp + goes）
+- [ ] 版本号策略：kernel/service/app/onepkg spec
+- [ ] dist 输出清晰：qemu可直接跑、日志可复现
+
+Stage 12 最终验收（“核心收尾”）
+- [ ] 新人只看文档+模板，就能写一个多文件App并打包安装运行
+- [ ] 服务示例可跑，驱动服务化示例可用
+- [ ] UI可用且可回落，系统更新可回滚
+- [ ] 基本安全边界稳定、可审计、可恢复

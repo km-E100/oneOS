@@ -1,0 +1,178 @@
+oneOS v2 TODO List（全内核态 + Sandbox Domain 隔离；冻结四大 Workspace）
+==============================================================================
+
+说明（必须遵守）
+------------------------------------------------------------------------------
+- oneOS 明确采用“全内核态运行 + Sandbox Domain 隔离”，放弃传统 user/kernel 特权级划分。
+- 隔离/权限/安全边界完全由：Domain + Capability + Policy + Workspace 语义 强制；不得依赖路径/目录权限。
+- Workspace 是系统级抽象（语义空间/权限边界/默认 View Scope），不是目录树或路径别名。
+
+冻结语义（Frozen Semantics：不可变前提）
+------------------------------------------------------------------------------
+系统中存在且仅存在四个系统级 Workspace：
+- System
+- Users
+- Applications
+- Library
+
+硬规则：
+- 这四个 Workspace 绝不允许：删除/重命名/替换为普通 Workspace/退化为目录或路径概念（任何版本都不允许）。
+- 任何设计/实现/TODO 拆解，都必须将这四个 Workspace 视为不可变前提。
+
+核心语义（v2 行为目标）
+------------------------------------------------------------------------------
+System
+- Normal 运行态：严格只读；任何写入尝试必须返回明确权限错误（不得 panic）。
+- 只有在 Recovery 模式 且 SIP=OFF 且通过 capability+policy 校验时允许写入。
+- 写入失败语义：安全拒绝或 fault（由 Domain/FaultPolicy 决定），不得导致系统崩溃。
+
+Users
+- Users 是用户对象与用户 home 空间的集合。
+- 每个用户拥有 User:<name> home Workspace。
+- 普通用户：只能进入/读写自己的 User:<name>；禁止进入/写入其他用户的 Workspace。
+- 管理员：可在 Users 下执行用户管理（创建/禁用等）。
+- 任何跨用户写入：必须拒绝并触发权限错误或 Domain fault（由 policy 指定）。
+
+Applications
+- 应用注册与生命周期管理空间（AppManifest/AppBinary/AppCapabilities/安装与移除元数据）。
+- install/remove：仅 admin 可写 Applications。
+- 普通用户可 run 已安装应用，但不等同于写 Applications。
+- Applications 不是应用运行态数据空间；运行态数据按 Domain+policy 另行约束。
+
+Library
+- 系统级共享资源/组件集合（可被多个 App/系统服务共享）。
+- v1/v2 默认：normal 只读；admin 可写；规则必须长期稳定、不可模糊化。
+
+运行实体（Domain）与隔离语义（v2 目标）
+------------------------------------------------------------------------------
+- KernelDomain：内核 TCB 域（最高权限）。
+- SystemServiceDomain：系统服务域（受限但高于应用）。
+- AppDomain：应用域（默认最小权限）。
+
+硬规则：
+- 任何资源访问必须通过 capability（cap handle），并由 policy 校验。
+- AppDomain 默认不具备系统特权：不得写 System；不得越权写 Library；不得访问/写未授权 Users。
+- 违规行为必须触发 Domain fault（kill/restart/quarantine），而不是 kernel panic。
+
+里程碑（只写计划：本轮不推进实现）
+------------------------------------------------------------------------------
+V2-M0 规范固化与基线
+V2-M1 冻结四大 Workspace（硬编码语义 + 不可变约束）
+V2-M2 Capability/Policy 统一入口（所有系统服务走同一校验框架）
+V2-M3 Domain 执行模型 v2（AppDomain 真正运行；单任务/单实例起步）
+V2-M4 App Full Realization（应用二进制/能力/生命周期闭环）
+V2-M5 Domain fault 完整语义（可控崩溃、自动恢复路径、审计）
+
+
+第 0 阶段：规范与防倒退（必须先完成）
+------------------------------------------------------------------------------
+0.1 冻结语义落库（Spec → 代码约束）
+- [x] 在代码中显式声明四大 Workspace 为系统常量集合（System/Users/Applications/Library）
+- [x] 禁止“替换/改写”冻结 Workspace：写路径拒绝 create_workspace / workspace_spec 作用于系统级 Workspace（返回权限错误，不 panic）
+- [x] 防绕过：UpdateObjectMeta/AddEdge/RemoveEdge 若触及 System 对象/迁入 System，要求 System 写权限（否则拒绝）
+- [x] 在 shell 与 GOES 层统一显示/引用这四大 Workspace（`ws list` 固定展示 + 相关命令拒绝对 System/Users/Applications/Library 做 ws set/mkws）
+
+0.2 验收基线（不新增功能也必须持续通过）
+- [x] 双架构可启动并进入 shell（验收：QEMU）
+- [x] GOES 能读（superblock/checkpoint/bootmanifest/replay）（验收：`goes status/ls`）
+- [x] System Normal 写入被拒绝（权限错误，不 panic）（验收：对 System 写入相关命令）
+
+
+第 1 阶段：Workspace 语义硬化（v2 的地基，已完成）
+------------------------------------------------------------------------------
+1.1 System Workspace：严格只读 + SIP/Recovery gating
+- [x] Normal：任何写 System → PermissionDenied（清晰错误）
+- [x] Recovery + SIP=ON：写 System → PermissionDenied
+- [x] Recovery + SIP=OFF：仅持有 system-write capability + policy 允许才可写
+- [x] 写 System 的审计事件：记录到 GOES log（record: `RECORD_AUDIT_V1=0x1_0300`，可回放）
+
+1.2 Users Workspace：跨用户隔离
+- [x] User:<name> home Workspace 的“所有者”语义固定（owner=name）
+- [x] 默认禁止跨用户 enter/write（错误或 Domain fault；写路径按目标 workspace 校验）
+- [x] admin 用户管理：create/disable/enable（写入 Users workspace 的 record；shell: `user ...`）
+
+1.3 Applications Workspace：管理与运行分离
+- [x] install/remove 必须要求 admin capability（写路径/策略拒绝）
+- [x] run/stop 不写 Applications（仅影响运行态；持久化记录写入 User workspace 的 uses edge）
+- [x] 应用运行态数据不得写入 Applications（运行态仅 Domain/内存；持久化仅写 User workspace）
+
+1.4 Library Workspace：稳定共享边界
+- [x] normal 默认只读（policy）
+- [x] admin 写入需明确 capability（GOES_WRITE + scope=Library）
+- [x] Library 的可用性不应破坏 System 可启动（读取失败返回错误/降级，不 panic；恢复路径由 Recovery/SIP 章节实现）
+
+
+第 2 阶段：Capability + Policy 统一入口（强制执行）
+------------------------------------------------------------------------------
+2.1 CapabilityTable（内核根发行者）
+- [x] 内核维护 capability 表，外部仅持有 handle/令牌（不可伪造）
+- [x] Capability 必须包含：cap_type + scope + rights（可选 limits/expiry）
+- [x] capability 传播规则：默认不可任意传播；仅允许子集继承（v2：仅内核发放，未提供外部转授权接口）
+
+2.2 Policy 引擎（最小可用）
+- [x] 所有资源访问统一走：Domain 身份确认 → Capability 校验 → Policy 校验 → 参数边界校验（v2 最小：先覆盖 GOES/GPU）
+- [x] policy 覆盖 GOES_READ/WRITE（按 workspace scope + Users 跨用户规则 + SIP gating）
+- [x] policy 覆盖 GPU_DRAW（已存在 `require_gpu_draw`，并加入 domain scope 校验）
+- [x] policy 失败必须返回明确错误码（不得 panic）
+- [x] goes::replay::snapshot() 读路径纳入 capability/policy：返回按当前 Domain 可见性过滤后的索引
+
+2.3 指针/内存参数边界（v2 语义）
+- [x] 服务入口对任意“指针+长度”参数做域内校验（v2 最小：以域 scope/capability 作为第一道边界；指针隔离留待 v3 页表/共享内存）
+- [x] 越界/非法访问触发 Domain fault（已存在 fault 机制；具体指针校验与内存域隔离在 v2 后续子阶段细化）
+
+
+第 3 阶段：Domain 执行模型 v2（AppDomain 真正运行）
+------------------------------------------------------------------------------
+3.1 Domain 生命周期
+- [x] Domain 生命周期 API（v2 单任务语义）：start/stop/restart/quarantine/kill + state 机
+- [x] 资源回收最小语义：stop 会清空 domain cap handles（cap 表保留；后续可做更强回收）
+- [x] 运行态状态表可查询（shell：`domain list` / `domain info`）
+
+3.2 Fault vs Panic（必须区分）
+- [x] fault：按 Domain 的 FaultPolicy 执行（kill/restart/quarantine/escalate），默认不触发 kernel panic
+- [x] panic：仅用于内核不可恢复错误；boot-critical 域在 boot-phase fault 会主动 panic（便于 oneboot 计入启动失败）
+- [x] 启动失败计数语义：AppDomain fault 不触发 panic（不应计入启动失败）；boot-critical fault 在 boot-phase 触发 panic（计入）
+
+
+第 4 阶段：App Full Realization（v2 重点）
+------------------------------------------------------------------------------
+4.1 应用对象模型完整化（Applications）
+- [x] AppManifest（name/version/entry）：新增 v2 manifest record（兼容读取 v1）
+- [x] AppBinary（ELF/Blob：可加载与校验）：新增 v2 binary record（可附带 bytes；内核可选验证 ELF 头）
+- [x] AppCapabilities（cap request 描述）：新增 v2 caps record（caps_mask 位图，后续可扩展为结构化描述）
+- [x] AppWorkspace（私有数据空间）：run 时在 `User:<u>/Apps/<app>` 创建（不在 Applications 写运行态数据）
+
+4.2 应用运行模型（AppDomain）
+- [x] app run：创建 AppDomain（spawn+start）+ 记录 uses edge；支持 `builtin:*` entry 执行（ELF 执行后续里程碑）
+- [x] app stop：stop_domain + kill_domain（回收运行态与句柄）
+- [x] app remove：仅 admin；写 Applications 的 remove record（v2 remove record）
+
+4.3 App 访问规则（必须强制）
+- [x] AppDomain 默认禁止写 System（无 GOES_WRITE(System) cap + scope 拦截）
+- [x] AppDomain 禁止越权写 Library（无 GOES_WRITE(Library) cap + scope 拦截）
+- [x] AppDomain 禁止访问/写未授权 Users Workspace（scope 仅绑定到当前 user；跨用户由 policy 拒绝）
+- [x] 违规触发 Domain fault，不得 kernel panic（fault→policy；非 boot-critical 不升级为 panic）
+
+
+第 5 阶段：审计（Audit）与恢复（Recovery）闭环
+------------------------------------------------------------------------------
+5.1 关键操作审计
+- [x] capability 发放/回收（sandbox::grant_cap + stop/kill_domain 审计事件）
+- [x] System/Library 写操作（System 写追加 RECORD_AUDIT_V1；Library 写追加 RECORD_AUDIT_EVENT_V1）
+- [x] 用户创建/禁用/切换（shell/user + goes mkuser + goes boot set-active 追加审计事件）
+- [x] 应用 install/remove/run/stop（kernel::app 追加审计事件）
+
+5.2 Recovery/SIP 行为
+- [x] SIP 状态只能在 Recovery 中切换（Normal 禁止；writer 强制 recovery+admin；shell 提供 `sip on/off`）
+- [x] System 写入只在 Recovery + SIP=OFF 有效（policy/require_goes_write 强制；失败返回权限错误不 panic）
+- [x] 恢复模式命令集受限（allowed_in_recovery 白名单 + 新增 `sip`）
+
+
+验收清单（v2）
+------------------------------------------------------------------------------
+- [ ] 四大 Workspace 语义不可变（不可删除/不可重命名/不可替代）
+- [ ] System Normal 写入：稳定拒绝（不 panic）
+- [ ] Users 跨用户写入：拒绝或 fault（可复现）
+- [ ] Applications install/remove：admin-only；normal run 不写 Applications
+- [ ] Library normal 只读；admin 写入需 capability
+- [ ] AppDomain 违规访问触发 fault，不触发 panic

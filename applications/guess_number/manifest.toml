@@ -1,0 +1,4 @@
+name = "guess_number"
+version = "0.1"
+entry = "elf:v1"
+caps_mask = "0x1" # CONSOLE only
