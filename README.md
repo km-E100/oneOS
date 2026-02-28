@@ -10,15 +10,15 @@ oneOS is an experimental operating system kernel written in Rust.
 
 ---
 
-# 🚀 Quick Start (Windows)
+## 🚀 Quick Start (Windows)
 
-## 1️⃣ Install QEMU (Recommended Default Path)
+### 1️⃣ Install QEMU (Recommended Default Path)
 
 Download and install QEMU for Windows:
 
 https://www.qemu.org/download/
 
-⚠️ Recommended installation path:
+Recommended installation path:
 
 C:\Program Files\qemu\
 
@@ -29,19 +29,20 @@ C:\Program Files\qemu\share\edk2-x86_64-code.fd
 
 ---
 
-## 2️⃣ Install Rust Nightly
+### 2️⃣ Install Rust Nightly
 
 ```bash
 rustup toolchain install nightly
 rustup target add aarch64-unknown-uefi x86_64-unknown-uefi
+
 3️⃣ Build
 cargo run -p xtask -- build
+
 4️⃣ Run (AArch64 Recommended)
 cargo run -p xtask -- run --arch aarch64 --firmware "C:\Program Files\qemu\share\edk2-aarch64-code.fd" --display sdl --mem 4096
+
 Optional: Run on x86_64
 cargo run -p xtask -- run --arch x86_64 --firmware "C:\Program Files\qemu\share\edk2-x86_64-code.fd" --display sdl --mem 1024
-
-If QEMU is installed in a different location, adjust the --firmware path accordingly.
 
 📦 Project Structure
 kernel/          Core kernel
@@ -49,28 +50,8 @@ bootloader/      UEFI bootloader
 applications/    User programs
 xtask/           Build & run automation
 dist/            Generated ESP & GOES images
-📌 Current Status
 
- Dual-architecture build
-
- UEFI boot
-
- GOES filesystem image generation
-
- Recovery / BootState logic
-
- User isolation
-
- SMP support
-
- x86_64 #UD root cause resolution
-
-🧪 x86_64 Debugging
-
-x86_64 currently triggers #UD when entering scheduler.
-Tracked in Issue #1.
-
-Contributions welcome.
+🧠 Architecture Overview
 
 UEFI bootloader loads raw kernel image
 
@@ -87,6 +68,31 @@ Panic ring buffer
 One-boot recovery flags
 
 SIP state mirroring via ESP
+
+📌 Current Status
+
+√ Dual-architecture build
+
+√ UEFI boot
+
+√ GOES filesystem image generation
+
+√ Recovery / BootState logic
+
+× User isolation
+
+× SMP support
+
+× x86_64 #UD root cause resolution
+
+🧪 x86_64 Debugging
+
+x86_64 currently triggers #UD when entering scheduler.
+
+Tracked in:
+👉 Issue #1 (RIP=0xA0078)
+
+Contributions welcome.
 
 🔄 Recovery & ESP Control
 
@@ -105,33 +111,7 @@ Record panic entries
 Toggle SIP mirror state
 
 📷 Example Output
-
-(Insert your VGA / QEMU screenshot here)
-
-📌 Current Status
-
- UEFI boot
-
- Dual-arch build system
-
- GOES filesystem image generation
-
- Recovery / BootState logic
-
- User domain isolation
-
- SMP support
-
- x86_64 #UD root cause resolution
-
-🧪 x86_64 #UD Investigation
-
-x86_64 currently triggers #UD when entering scheduler.
-
-Tracked in:
-👉 Issue #1 (RIP=0xA0078)
-
-Contributions welcome.
+<img width="764" height="600" alt="image" src="https://github.com/user-attachments/assets/a6c2b8c0-5312-4c20-8324-1a59bc2b4d8b" />
 
 🌊 Why oneOS?
 
