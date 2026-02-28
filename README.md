@@ -92,7 +92,7 @@ SIP state mirroring via ESP
 
 Advanced boot and recovery commands are documented in:
 
-help.txt
+build_and_run.txt
 
 Includes:
 
