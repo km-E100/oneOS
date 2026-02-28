@@ -2,30 +2,46 @@
 
 oneOS is an experimental operating system kernel written in Rust.
 
-- ✅ UEFI-based boot
-- ✅ AArch64 support (stable)
+- ✅ UEFI boot
+- ✅ AArch64 support (recommended)
 - ⚠️ x86_64 under active debugging (#UD investigation)
 - 🔧 Custom GOES filesystem
-- 🔄 BootState & Recovery mechanism implemented
+- 🔄 BootState & Recovery mechanism
 
 ---
 
-## 🚀 Quick Start (Windows)
+# 🚀 Quick Start (Windows)
 
-### 1️⃣ Install toolchain
+## 1️⃣ Install QEMU (Recommended Default Path)
+
+Download and install QEMU for Windows:
+
+https://www.qemu.org/download/
+
+⚠️ Recommended installation path:
+
+C:\Program Files\qemu\
+
+Make sure firmware exists at:
+
+C:\Program Files\qemu\share\edk2-aarch64-code.fd  
+C:\Program Files\qemu\share\edk2-x86_64-code.fd  
+
+---
+
+## 2️⃣ Install Rust Nightly
 
 ```bash
 rustup toolchain install nightly
 rustup target add aarch64-unknown-uefi x86_64-unknown-uefi
-2️⃣ Build
+3️⃣ Build
 cargo run -p xtask -- build
-3️⃣ Run (AArch64 recommended)
-cargo run -p xtask -- run --arch aarch64 --display sdl --mem 1024
+4️⃣ Run (AArch64 Recommended)
+cargo run -p xtask -- run --arch aarch64 --firmware "C:\Program Files\qemu\share\edk2-aarch64-code.fd" --display sdl --mem 4096
 Optional: Run on x86_64
-cargo run -p xtask -- run --arch x86_64 --display sdl --mem 1024
+cargo run -p xtask -- run --arch x86_64 --firmware "C:\Program Files\qemu\share\edk2-x86_64-code.fd" --display sdl --mem 1024
 
-Make sure QEMU is installed and firmware paths are configured.
-Windows uses --display sdl.
+If QEMU is installed in a different location, adjust the --firmware path accordingly.
 
 📦 Project Structure
 kernel/          Core kernel
@@ -33,7 +49,28 @@ bootloader/      UEFI bootloader
 applications/    User programs
 xtask/           Build & run automation
 dist/            Generated ESP & GOES images
-🧠 Architecture Overview
+📌 Current Status
+
+ Dual-architecture build
+
+ UEFI boot
+
+ GOES filesystem image generation
+
+ Recovery / BootState logic
+
+ User isolation
+
+ SMP support
+
+ x86_64 #UD root cause resolution
+
+🧪 x86_64 Debugging
+
+x86_64 currently triggers #UD when entering scheduler.
+Tracked in Issue #1.
+
+Contributions welcome.
 
 UEFI bootloader loads raw kernel image
 
@@ -55,7 +92,7 @@ SIP state mirroring via ESP
 
 Advanced boot and recovery commands are documented in:
 
-docs/boot-and-recovery.md
+help.txt
 
 Includes:
 
